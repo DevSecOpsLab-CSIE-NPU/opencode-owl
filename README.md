@@ -14,12 +14,14 @@ Agent Memory System for OpenCode/Sisyphus framework, based on the paper **"Memor
 
 ```bash
 # One-liner installation
-curl -fsSL https://raw.githubusercontent.com/AugustChaoTW/aug-money/main/packages/opencode-memory-system/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/DevSecOpsLab-CSIE-NPU/opencode-owl/main/install.sh | bash
 ```
 
 Or manually:
 
-```bash
+git clone https://github.com/DevSecOpsLab-CSIE-NPU/opencode-owl.git
+cd opencode-owl
+./install.sh
 # Clone and install
 git clone https://github.com/AugustChaoTW/aug-money.git
 cd aug-money/packages/opencode-memory-system
@@ -31,7 +33,7 @@ cd aug-money/packages/opencode-memory-system
 ### 1. Install Dependencies & Build
 
 ```bash
-cd packages/opencode-memory-system
+cd opencode-owl
 bun install
 bun run build
 ```
@@ -174,6 +176,11 @@ bun run clean
 ```
 
 ## References
+
+- Original Source: [aug-money/packages/opencode-memory-system](https://github.com/AugustChaoTW/aug-money/tree/main/packages/opencode-memory-system)
+- Paper: [Memory in the Age of AI Agents](https://arxiv.org/abs/2512.13564v2)
+- GitHub: [Agent-Memory-Paper-List](https://github.com/Shichun-Liu/Agent-Memory-Paper-List)
+- OpenCode: [opencode-ai/opencode](https://github.com/opencode-ai/opencode)
 
 - Paper: [Memory in the Age of AI Agents](https://arxiv.org/abs/2512.13564v2)
 - GitHub: [Agent-Memory-Paper-List](https://github.com/Shichun-Liu/Agent-Memory-Paper-List)
