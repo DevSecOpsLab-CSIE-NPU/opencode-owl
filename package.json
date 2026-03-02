@@ -1,0 +1,45 @@
+{
+  "name": "opencode-memory-system",
+  "version": "1.0.0",
+  "description": "Agent Memory System Plugin for OpenCode - Based on 'Memory in the Age of AI Agents' (arXiv:2512.13564v2)",
+  "author": "AugustChaoTW",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "files": [
+    "dist/",
+    "src/",
+    "README.md",
+    "install.sh"
+  ],
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target node && cp node_modules/sql.js/dist/sql-wasm.wasm dist/",
+    "dev": "bun build src/index.ts --outdir dist --target node --watch",
+    "install:plugin": "./install.sh",
+    "clean": "rm -rf dist node_modules"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.2.15",
+    "sql.js": "^1.14.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.9",
+    "bun-types": "^1.2.4",
+    "typescript": "^5.8.2"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "memory",
+    "agent",
+    "ai",
+    "llm"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AugustChaoTW/aug-money"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
