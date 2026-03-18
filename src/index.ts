@@ -559,6 +559,17 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
           return `Current task set to: ${args.task}`;
         },
       }),
+      memory_status: tool({
+        description: "Get a concise status of the memory system.",
+        args: {},
+        async execute() {
+          const stats = store.getStats();
+          const context = store.getSessionContext();
+          const task = context?.currentTask || "None";
+          const recentTools = context?.recentTools?.slice(-3).join(", ") || "None";
+          return `🧠 Memory: ${stats.total} items | 🎯 Task: ${task} | 🔧 Recent: ${recentTools}`;
+        }
+      }),
     },
   };
 };
