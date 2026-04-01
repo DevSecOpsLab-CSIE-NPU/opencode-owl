@@ -1,54 +1,38 @@
 # OpenCode Memory System Plugin
 
-Agent Memory System for OpenCode/Sisyphus framework, based on the paper **"Memory in the Age of AI Agents: A Survey — Forms, Functions and Dynamics"** (arXiv:2512.13564v2).
+Agent memory system for the OpenCode/Sisyphus framework. Gives AI coding agents persistent, structured memory across sessions — facts, preferences, procedural skills, and episode tracking.
+
+Based on **"Memory in the Age of AI Agents: A Survey"** (arXiv:2512.13564v2) and informed by production systems including GitHub Copilot Agentic Memory (2026), A-MEM (NeurIPS 2025), and AWM (ICML 2025).
 
 ## Features
 
-- **Persistent Memory**: Stores facts, preferences, skills, and experiences across sessions
-- **Automatic Context Injection**: Relevant memories are automatically injected into system prompts
-- **Tool Tracking**: Automatically records tool usage patterns
-- **Session Context**: Maintains current task and recent activity context
-- **SQLite Storage**: Uses sql.js (pure JavaScript SQLite) for cross-platform compatibility
+- **FTS5 Full-Text Search** — BM25-ranked search replaces `LIKE` scans; graceful fallback when unavailable
+- **Memory Decay Ranking** — `score = importance × exp(-λt) × log(2 + access_count)` surfaces recently-used memories first
+- **Global / Project Layers** — cross-project preferences in `global.db`; per-repo facts in `memory.db`
+- **Privacy Filter** — regex redaction of API keys, tokens, and credentials before writing to global layer
+- **Procedural Skill Memory** — structured workflows with trigger patterns, step lists, and citation verification
+- **Episode Tracking** — record task attempts with goal/outcome/actions; lessons auto-promote to persistent facts
+- **Schema Versioning** — `schema_version` table + automatic migrations (v1 → v2 → v3)
+- **CRUD Tools** — full create/read/update/delete for agent-managed memories
 
 ## Quick Install
 
 ```bash
-# One-liner installation
 curl -fsSL https://raw.githubusercontent.com/DevSecOpsLab-CSIE-NPU/opencode-owl/main/install.sh | bash
-```
-
-Or manually:
-
-git clone https://github.com/DevSecOpsLab-CSIE-NPU/opencode-owl.git
-cd opencode-owl
-./install.sh
-# Clone and install
-git clone https://github.com/AugustChaoTW/aug-money.git
-cd aug-money/packages/opencode-memory-system
-./install.sh
 ```
 
 ## Manual Installation
 
-### 1. Install Dependencies & Build
-
 ```bash
+git clone https://github.com/DevSecOpsLab-CSIE-NPU/opencode-owl.git
 cd opencode-owl
-bun install
-bun run build
-```
-
-### 2. Copy to OpenCode Plugins Directory
-
-```bash
+bun install && bun run build
 mkdir -p ~/.config/opencode/plugins/memory-system
 cp -r dist/* ~/.config/opencode/plugins/memory-system/
 cp package.json ~/.config/opencode/plugins/memory-system/
 ```
 
-### 3. Configure OpenCode
-
-Add to your `~/.config/opencode/opencode.json`:
+Add to `~/.config/opencode/opencode.json`:
 
 ```json
 {
@@ -56,135 +40,217 @@ Add to your `~/.config/opencode/opencode.json`:
 }
 ```
 
-### 4. Restart OpenCode
-
-The plugin will automatically initialize on next session.
+Restart OpenCode. The plugin initializes both databases on first run.
 
 ## Available Tools
 
+### Core CRUD
+
 | Tool | Description |
 |------|-------------|
-| `memory_add` | Add new information to memory (fact/preference/skill) |
-| `memory_query` | Query memories by keyword or type |
-| `memory_stats` | Get memory statistics |
-| `memory_set_task` | Set current task context |
+| `memory_add` | Add a fact, preference, or skill (supports `layer` param) |
+| `memory_query` | FTS5-powered search across project + global layers |
+| `memory_list` | Browse all memories with decay score and type filter |
+| `memory_update` | Edit content or importance of an existing memory |
+| `memory_delete` | Remove a memory by ID |
+| `memory_promote` | Copy a global memory into the current project layer |
 
-### Usage Examples
+### Procedural Skills
 
-```typescript
-// Add a user preference
-memory_add(type="preference", content="User prefers Traditional Chinese responses", importance=0.9)
+| Tool | Description |
+|------|-------------|
+| `memory_add_skill` | Store a reusable workflow (trigger patterns + steps + citations) |
+| `memory_approve_skill` | Mark a skill as human-reviewed (confidence 0.9) |
+| `memory_validate_citations` | Check that all `file:line` citations still exist on disk |
 
-// Add a learned fact
-memory_add(type="fact", content="This project uses TypeScript with strict mode", importance=0.8)
+### Episode Tracking
 
-// Query memories
-memory_query(query="user preferences", type="preference", limit=5)
+| Tool | Description |
+|------|-------------|
+| `memory_start_episode` | Begin tracking a task attempt with a stated goal |
+| `memory_end_episode` | Close episode with outcome + lessons; lessons auto-promote to facts |
+| `memory_list_episodes` | List recent episodes with outcome, action count, and lesson count |
 
-// Check stats
-memory_stats()
+### Utility
 
-// Set current task context
-memory_set_task(task="Implementing new feature X")
+| Tool | Description |
+|------|-------------|
+| `memory_stats` | Project + global memory counts, by-type breakdown |
+| `memory_set_task` | Set current task context (shown in system prompt) |
+| `memory_status` | One-line memory system summary |
+
+## Usage Examples
+
+```
+# Remember a project fact
+memory_add(type="fact", content="This project uses bun test, not npm test", importance=0.9)
+
+# Remember a cross-project preference in global layer
+memory_add(type="preference", content="Respond in Traditional Chinese", importance=0.95, layer="global")
+
+# Search with FTS5 (searches project + global)
+memory_query(query="test runner", limit=5)
+
+# Add a procedural skill
+memory_add_skill(
+  name="test-before-commit",
+  trigger_patterns=["commit", "push", "PR"],
+  steps=["run bun test", "if tests pass: git commit", "git push"],
+  applicability="when user has uncommitted changes",
+  citations=["package.json:5", "Makefile:12"]
+)
+
+# Approve a skill after verifying it's correct
+memory_approve_skill(id="mem_1234_abcd")
+
+# Track a task attempt
+memory_start_episode(goal="Fix the auth middleware bug")
+# ... do work ...
+memory_end_episode(
+  outcome="success",
+  lessons_learned=["JWT expiry must be checked before signature"],
+  mistakes=["First tried rotating the key instead of checking expiry"],
+  importance_score=8
+)
+
+# Review what episodes you've worked on
+memory_list_episodes(limit=5)
 ```
 
-## Data Storage
+## Storage Layout
 
-- **Database**: `~/.local/share/opencode/memory/memory.db`
-- **Format**: SQLite (via sql.js WASM)
-- **Persistence**: Per-project (based on working directory hash)
+```
+~/.local/share/opencode/memory/
+  memory.db          ← Project layer (per-session, per-repo facts)
+
+~/.config/opencode/memory/
+  global.db          ← Global layer (cross-project user preferences)
+```
+
+Both databases use SQLite via sql.js (pure-JS WASM, no native extensions required).
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│           OpenCode Memory Plugin                │
-├─────────────────────────────────────────────────┤
-│  Hooks:                                         │
-│  ├── chat.system.transform → Inject memories    │
-│  ├── chat.message → Record conversations        │
-│  └── tool.execute.after → Track tool usage      │
-├─────────────────────────────────────────────────┤
-│  Tools:                                         │
-│  ├── memory_add                                 │
-│  ├── memory_query                               │
-│  ├── memory_stats                               │
-│  └── memory_set_task                            │
-├─────────────────────────────────────────────────┤
-│  Storage: SQLite (sql.js WASM)                  │
-│  ├── memories (facts, preferences, skills)      │
-│  ├── session_context (current task, tools)      │
-│  └── conversation_history (last 50 messages)    │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                  OpenCode Memory Plugin v3                   │
+├──────────────────────────────────────────────────────────────┤
+│  Hooks                                                       │
+│  ├── chat.system.transform  → inject relevant memories       │
+│  │     skills rendered as step lists; unreviewed flagged ⚠️  │
+│  ├── chat.message           → record conversation history    │
+│  └── tool.execute.after     → upsert tool usage aggregate    │
+│                               + append action to episode     │
+├──────────────────────────────────────────────────────────────┤
+│  Memory Layers                                               │
+│  ├── Global DB   ~/.config/opencode/memory/global.db         │
+│  │     cross-project preferences; privacy-filtered writes    │
+│  └── Project DB  ~/.local/share/opencode/memory/memory.db    │
+│        per-session facts, skills, experiences, episodes      │
+├──────────────────────────────────────────────────────────────┤
+│  Schema (v3)                                                 │
+│  ├── memories    id, type, content, citations, source,       │
+│  │               confidence, importance, decay metadata      │
+│  ├── episodes    goal, outcome, actions[], lessons[],        │
+│  │               mistakes[], importance_score, confidence    │
+│  ├── memory_fts  FTS5 virtual table (porter tokenizer)       │
+│  ├── memory_fts_rowmap  FTS5 ↔ memory ID mapping            │
+│  ├── session_context    current task, recent tools,          │
+│  │                      current_episode_id                   │
+│  ├── conversation_history  last 50 messages per session      │
+│  └── schema_version        migration tracking                │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ## Memory Types
 
-| Type | Description | Example |
-|------|-------------|---------|
-| `fact` | Objective information about the project/user | "This project uses React 18" |
-| `preference` | User preferences and habits | "User prefers verbose explanations" |
-| `skill` | Learned capabilities and patterns | "Can use grep for code search" |
-| `experience` | Past interactions (auto-recorded) | "Used Edit tool on file X" |
+| Type | Description | Auto-recorded |
+|------|-------------|:---:|
+| `fact` | Objective information (project setup, API behavior) | — |
+| `preference` | User habits and style preferences | — |
+| `skill` | Procedural workflows with trigger patterns and steps | — |
+| `experience` | Tool usage aggregates (`Edit × 47 this session`) | ✓ |
 
-## Configuration
+Skills with `source: "observed"` and `confidence < 0.7` are shown with a ⚠️ warning in the system prompt until reviewed with `memory_approve_skill`.
 
-The plugin uses sensible defaults but can be customized:
+## Retrieval Ranking
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| Memory limit | 10 | Max memories injected per prompt |
-| Min importance | 0.5 | Threshold for auto-injection |
-| Conversation history | 50 | Max messages stored per session |
-| Recent tools | 20 | Tool usage history length |
+All query results are scored and sorted by:
+
+```
+decayScore = importance × exp(-0.1 × days_since_access) × log(2 + access_count)
+```
+
+- New, important memories score high immediately
+- Frequently-accessed memories stay near the top
+- Stale, unvisited memories naturally sink
+
+Results from both layers are merged and deduplicated (project wins over global on identical content).
+
+## Privacy Filter
+
+Before writing to the **global layer**, content is scanned against:
+
+| Pattern | Matches |
+|---------|---------|
+| `sk-[a-zA-Z0-9]{20,}` | OpenAI API keys |
+| `ghp_[a-zA-Z0-9]{36}` | GitHub PATs |
+| `AKIA[0-9A-Z]{16}` | AWS Access Keys |
+| `-----BEGIN ... PRIVATE KEY-----` | Private keys |
+| `(api_key\|password\|secret\|token)\s*[:=]\s*\S+` | Generic secrets |
+| `bearer\s+...` | Bearer tokens |
+
+Matches are replaced with `[REDACTED]`; the write proceeds with sanitized content.
+
+## Schema Migrations
+
+| Version | Changes |
+|---------|---------|
+| v1 | Initial schema: memories, session_context, conversation_history |
+| v2 | FTS5 virtual table + rowmap; back-fills index for existing memories |
+| v3 | memories: +citations, +source, +confidence; session_context: +current_episode_id; episodes table |
+
+Migrations run automatically on startup. Existing data is preserved.
 
 ## Troubleshooting
 
-### Plugin not loading
+**Plugin not loading**
+1. Verify OpenCode supports plugins (`opencode --version` ≥ 1.0)
+2. Check `~/.config/opencode/opencode.json` has `"./plugins/memory-system"` in the `plugin` array
+3. Confirm build output: `ls ~/.config/opencode/plugins/memory-system/index.js`
 
-1. Check OpenCode version supports plugins
-2. Verify `opencode.json` has correct plugin path
-3. Check build output exists: `ls ~/.config/opencode/plugins/memory-system/`
+**FTS5 search returning no results**
+- FTS5 requires exact token matches (porter-stemmed). Try shorter queries.
+- Check `memory_stats()` — if `fts5Available` is false, queries fall back to LIKE automatically.
 
-### Memory not persisting
+**Memory not persisting**
+1. Check write permissions: `ls -la ~/.local/share/opencode/memory/`
+2. `memory_status()` reports DB paths on init.
 
-1. Check database directory exists: `ls ~/.local/share/opencode/memory/`
-2. Verify write permissions
-
-### sql.js WASM issues
-
-Ensure `sql-wasm.wasm` is in the same directory as `index.js`:
-
+**sql.js WASM missing**
 ```bash
 cp node_modules/sql.js/dist/sql-wasm.wasm dist/
+cp dist/sql-wasm.wasm ~/.config/opencode/plugins/memory-system/
 ```
 
 ## Development
 
 ```bash
-# Install dependencies
 bun install
-
-# Build
-bun run build
-
-# Watch mode
-bun run dev
-
-# Clean
-bun run clean
+bun run build    # outputs to dist/
+bun run dev      # watch mode
+bun run clean    # rm -rf dist node_modules
 ```
 
 ## References
 
-- Original Source: [aug-money/packages/opencode-memory-system](https://github.com/AugustChaoTW/aug-money/tree/main/packages/opencode-memory-system)
-- Paper: [Memory in the Age of AI Agents](https://arxiv.org/abs/2512.13564v2)
-- GitHub: [Agent-Memory-Paper-List](https://github.com/Shichun-Liu/Agent-Memory-Paper-List)
-- OpenCode: [opencode-ai/opencode](https://github.com/opencode-ai/opencode)
-
-- Paper: [Memory in the Age of AI Agents](https://arxiv.org/abs/2512.13564v2)
-- GitHub: [Agent-Memory-Paper-List](https://github.com/Shichun-Liu/Agent-Memory-Paper-List)
-- OpenCode: [opencode-ai/opencode](https://github.com/opencode-ai/opencode)
+- Paper: [Memory in the Age of AI Agents](https://arxiv.org/abs/2512.13564v2) — taxonomy this plugin is built on
+- Paper: [A-MEM (NeurIPS 2025)](https://arxiv.org/abs/2502.12110) — Zettelkasten memory evolution
+- Paper: [AWM (ICML 2025)](https://proceedings.mlr.press/v267/wang25bx.html) — workflow pattern extraction
+- Paper: [Du 2026 Survey](https://arxiv.org/abs/2603.07670) — write–manage–read memory model
+- Blog: [GitHub Copilot Agentic Memory](https://github.blog/ai-and-ml/github-copilot/building-an-agentic-memory-system-for-github-copilot/) — citation-based fact storage
+- Repo: [Agent-Memory-Paper-List](https://github.com/Shichun-Liu/Agent-Memory-Paper-List)
+- Framework: [opencode-ai/opencode](https://github.com/opencode-ai/opencode)
 
 ## License
 
