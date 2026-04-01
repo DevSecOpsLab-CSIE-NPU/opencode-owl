@@ -34,6 +34,8 @@ interface MemoryEntry {
   createdAt: number;
   updatedAt: number;
   lastAccessedAt: number;
+  memoryStrength: number;
+  reinforcementCount: number;
   layer?: MemoryLayer;
   decayScore?: number;
 }
@@ -77,7 +79,7 @@ interface Episode {
 
 const VALID_MEMORY_TYPES: MemoryType[] = ["fact", "experience", "preference", "skill"];
 const MAX_CONTENT_BYTES = 10 * 1024; // 10KB
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const DECAY_LAMBDA = 0.1;          // decay rate per day
 const GLOBAL_SESSION_ID = "__global__";
 
@@ -106,10 +108,16 @@ function redactSensitiveContent(content: string): { redacted: string; hadSensiti
   return { redacted, hadSensitive };
 }
 
-function computeDecayScore(importance: number, lastAccessedAt: number, accessCount: number): number {
+function computeDecayScore(
+  importance: number,
+  lastAccessedAt: number,
+  accessCount: number,
+  memoryStrength = 1.0
+): number {
   const daysSince = (Date.now() - lastAccessedAt) / 86_400_000;
-  const recency = Math.exp(-DECAY_LAMBDA * daysSince);
-  const frequency = Math.log(2 + accessCount); // log(2)≈0.69 for new memories
+  const effectiveLambda = DECAY_LAMBDA / memoryStrength;
+  const recency = Math.exp(-effectiveLambda * daysSince);
+  const frequency = Math.log(2 + accessCount);
   return importance * recency * frequency;
 }
 
@@ -270,27 +278,17 @@ class MemoryStore {
           try { db.run(`ALTER TABLE memories ADD COLUMN source TEXT DEFAULT 'observed'`); } catch { /* already exists */ }
           try { db.run(`ALTER TABLE memories ADD COLUMN confidence REAL DEFAULT 0.8`); } catch { /* already exists */ }
           try { db.run(`ALTER TABLE session_context ADD COLUMN current_episode_id TEXT`); } catch { /* already exists */ }
-
-          db.run(`
-            CREATE TABLE IF NOT EXISTS episodes (
-              episode_id TEXT PRIMARY KEY,
-              session_id TEXT NOT NULL,
-              goal TEXT DEFAULT '',
-              outcome TEXT DEFAULT 'unknown',
-              actions TEXT DEFAULT '[]',
-              lessons_learned TEXT DEFAULT '[]',
-              mistakes TEXT DEFAULT '[]',
-              importance_score REAL DEFAULT 5.0,
-              keywords TEXT DEFAULT '[]',
-              supersedes TEXT DEFAULT '[]',
-              confidence REAL DEFAULT 0.8,
-              created_at INTEGER NOT NULL,
-              updated_at INTEGER NOT NULL
-            )
-          `);
-          db.run(`CREATE INDEX IF NOT EXISTS idx_episodes_session ON episodes(session_id)`);
         } catch (e) {
           console.error("[Memory] Migration v3 error:", e);
+        }
+      }
+
+      if (current < 4) {
+        try {
+          try { db.run(`ALTER TABLE memories ADD COLUMN memory_strength REAL DEFAULT 1.0`); } catch { /* already exists */ }
+          try { db.run(`ALTER TABLE memories ADD COLUMN reinforcement_count INTEGER DEFAULT 0`); } catch { /* already exists */ }
+        } catch (e) {
+          console.error("[Memory] Migration v4 error:", e);
         }
       }
 
@@ -402,7 +400,7 @@ class MemoryStore {
   // ---- Memory CRUD ----
 
   addMemory(
-    entry: Omit<MemoryEntry, "id" | "accessCount" | "createdAt" | "updatedAt" | "lastAccessedAt" | "layer" | "decayScore">,
+    entry: Omit<MemoryEntry, "id" | "accessCount" | "createdAt" | "updatedAt" | "lastAccessedAt" | "memoryStrength" | "reinforcementCount" | "layer" | "decayScore">,
     layer: MemoryLayer = "project"
   ): string {
     const err = this.validateInput(entry.type, entry.content, entry.importance);
@@ -511,9 +509,8 @@ class MemoryStore {
       results.push(...this.queryDb(this.globalDb, GLOBAL_SESSION_ID, options, "global"));
     }
 
-    // Apply decay scoring and sort
     for (const m of results) {
-      m.decayScore = computeDecayScore(m.importance, m.lastAccessedAt, m.accessCount);
+      m.decayScore = computeDecayScore(m.importance, m.lastAccessedAt, m.accessCount, m.memoryStrength);
     }
     results.sort((a, b) => (b.decayScore ?? 0) - (a.decayScore ?? 0));
 
@@ -554,7 +551,9 @@ class MemoryStore {
 
         const res = db.exec(sql, params);
         if (res.length === 0) return [];
-        return res[0].values.map((row: unknown[]) => ({ ...this.rowToEntry(res[0].columns, row), layer }));
+        const entries = res[0].values.map((row: unknown[]) => ({ ...this.rowToEntry(res[0].columns, row), layer }));
+        this.bumpAccessStats(db, entries.map(e => e.id));
+        return entries;
       }
 
       // LIKE fallback
@@ -570,7 +569,9 @@ class MemoryStore {
 
       const res = db.exec(sql, params);
       if (res.length === 0) return [];
-      return res[0].values.map((row: unknown[]) => ({ ...this.rowToEntry(res[0].columns, row), layer }));
+      const entries = res[0].values.map((row: unknown[]) => ({ ...this.rowToEntry(res[0].columns, row), layer }));
+      this.bumpAccessStats(db, entries.map(e => e.id));
+      return entries;
     } catch (e) {
       console.error("[Memory] queryDb error:", e);
       return [];
@@ -589,7 +590,7 @@ class MemoryStore {
     }
 
     for (const m of results) {
-      m.decayScore = computeDecayScore(m.importance, m.lastAccessedAt, m.accessCount);
+      m.decayScore = computeDecayScore(m.importance, m.lastAccessedAt, m.accessCount, m.memoryStrength);
     }
     results.sort((a, b) => (b.decayScore ?? 0) - (a.decayScore ?? 0));
     return results.slice(0, limit);
@@ -819,7 +820,62 @@ class MemoryStore {
       createdAt: row[i("created_at")] as number,
       updatedAt: row[i("updated_at")] as number,
       lastAccessedAt: row[i("last_accessed_at")] as number,
+      memoryStrength: (i("memory_strength") >= 0 ? row[i("memory_strength")] as number : null) ?? 1.0,
+      reinforcementCount: (i("reinforcement_count") >= 0 ? row[i("reinforcement_count")] as number : null) ?? 0,
     };
+  }
+
+  private bumpAccessStats(db: Database, ids: string[]): void {
+    if (ids.length === 0) return;
+    const now = Date.now();
+    try {
+      for (const id of ids) {
+        db.run(
+          `UPDATE memories SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?`,
+          [now, id] as RowParam[]
+        );
+      }
+    } catch (e) {
+      console.error("[Memory] bumpAccessStats error:", e);
+    }
+  }
+
+  reinforceMemory(id: string): { success: boolean; newStrength: number; newDecayScore: number } {
+    const notFound = { success: false, newStrength: 0, newDecayScore: 0 };
+    for (const [db, sessionId, layer] of this.allDbs()) {
+      try {
+        const res = db.exec(
+          `SELECT importance, access_count, last_accessed_at, memory_strength, reinforcement_count FROM memories WHERE id = ? AND session_id = ?`,
+          [id, sessionId] as RowParam[]
+        );
+        if (res.length === 0 || res[0].values.length === 0) continue;
+
+        const row = res[0].values[0];
+        const [importance, accessCount, lastAccessedAt, strength, rCount] =
+          row as [number, number, number, number, number];
+
+        const currentStrength = strength ?? 1.0;
+        const currentRCount = rCount ?? 0;
+        const growthFactor = Math.max(1.2, 1.8 - 0.2 * currentRCount);
+        const newStrength = Math.min(10.0, currentStrength * growthFactor);
+        const now = Date.now();
+
+        db.run(
+          `UPDATE memories
+           SET memory_strength = ?, reinforcement_count = ?, access_count = access_count + 1,
+               last_accessed_at = ?, updated_at = ?
+           WHERE id = ? AND session_id = ?`,
+          [newStrength, currentRCount + 1, now, now, id, sessionId] as RowParam[]
+        );
+
+        this.forceSave(layer);
+        const newScore = computeDecayScore(importance, now, (accessCount ?? 0) + 1, newStrength);
+        return { success: true, newStrength, newDecayScore: newScore };
+      } catch (e) {
+        console.error("[Memory] reinforceMemory error:", e);
+      }
+    }
+    return notFound;
   }
 
   addSkillMemory(params: {
@@ -1303,6 +1359,19 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
             const lessons = ep.lessonsLearned.length;
             return `[${ep.outcome}] ${ep.episodeId}  goal: "${ep.goal.slice(0, 60)}"  actions:${actions}  lessons:${lessons}`;
           }).join("\n");
+        },
+      }),
+
+      memory_reinforce: tool({
+        description: "Explicitly reinforce a memory, slowing its decay rate. Each call multiplies memory_strength by a growth factor (diminishing returns: 1st ×1.8, 2nd ×1.6 … min ×1.2). strength=2 halves decay rate; strength=10 gives ~69-day half-life.",
+        args: {
+          id: tool.schema.string().describe("Memory ID to reinforce"),
+        },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sessionID || `project_${Buffer.from(directory).toString("base64").slice(0, 16)}`);
+          const result = store.reinforceMemory(args.id);
+          if (!result.success) return `Memory ${args.id} not found.`;
+          return `Memory ${args.id} reinforced.\n  memory_strength: ${result.newStrength.toFixed(2)}\n  new decay_score: ${result.newDecayScore.toFixed(4)}`;
         },
       }),
 
