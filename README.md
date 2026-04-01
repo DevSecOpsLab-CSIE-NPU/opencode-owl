@@ -2,17 +2,18 @@
 
 Agent memory system for the OpenCode/Sisyphus framework. Gives AI coding agents persistent, structured memory across sessions — facts, preferences, procedural skills, and episode tracking.
 
-Based on **"Memory in the Age of AI Agents: A Survey"** (arXiv:2512.13564v2) and informed by production systems including GitHub Copilot Agentic Memory (2026), A-MEM (NeurIPS 2025), and AWM (ICML 2025).
+Based on **"Memory in the Age of AI Agents: A Survey"** (arXiv:2512.13564v2) and informed by production systems including GitHub Copilot Agentic Memory (2026), A-MEM (NeurIPS 2025), AWM (ICML 2025), and MemoryBank (AAAI 2024).
 
 ## Features
 
 - **FTS5 Full-Text Search** — BM25-ranked search replaces `LIKE` scans; graceful fallback when unavailable
-- **Memory Decay Ranking** — `score = importance × exp(-λt) × log(2 + access_count)` surfaces recently-used memories first
+- **Memory Decay Ranking** — `score = importance × exp(-(λ/strength) × t) × log(2 + access_count)` surfaces actively-used memories
+- **Memory Reinforce** — FSRS-inspired multiplicative strength boost with diminishing returns; slows decay rate per reinforcement
 - **Global / Project Layers** — cross-project preferences in `global.db`; per-repo facts in `memory.db`
 - **Privacy Filter** — regex redaction of API keys, tokens, and credentials before writing to global layer
 - **Procedural Skill Memory** — structured workflows with trigger patterns, step lists, and citation verification
 - **Episode Tracking** — record task attempts with goal/outcome/actions; lessons auto-promote to persistent facts
-- **Schema Versioning** — `schema_version` table + automatic migrations (v1 → v2 → v3)
+- **Schema Versioning** — `schema_version` table + automatic migrations (v1 → v2 → v3 → v4)
 - **CRUD Tools** — full create/read/update/delete for agent-managed memories
 
 ## Quick Install
@@ -71,6 +72,12 @@ Restart OpenCode. The plugin initializes both databases on first run.
 | `memory_end_episode` | Close episode with outcome + lessons; lessons auto-promote to facts |
 | `memory_list_episodes` | List recent episodes with outcome, action count, and lesson count |
 
+### Reinforcement
+
+| Tool | Description |
+|------|-------------|
+| `memory_reinforce` | Boost a memory's `memory_strength`, slowing its decay rate (diminishing returns per call) |
+
 ### Utility
 
 | Tool | Description |
@@ -115,6 +122,11 @@ memory_end_episode(
 
 # Review what episodes you've worked on
 memory_list_episodes(limit=5)
+
+# Reinforce a critical memory so it decays more slowly
+memory_reinforce(id="mem_1234_abcd")
+# → memory_strength: 1.80 (1st call), new decay_score: 0.8342
+# → memory_strength: 2.88 (2nd call), half-life ~20 days
 ```
 
 ## Storage Layout
@@ -133,7 +145,7 @@ Both databases use SQLite via sql.js (pure-JS WASM, no native extensions require
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                  OpenCode Memory Plugin v3                   │
+│                  OpenCode Memory Plugin v4                   │
 ├──────────────────────────────────────────────────────────────┤
 │  Hooks                                                       │
 │  ├── chat.system.transform  → inject relevant memories       │
@@ -178,12 +190,32 @@ Skills with `source: "observed"` and `confidence < 0.7` are shown with a ⚠️ 
 All query results are scored and sorted by:
 
 ```
-decayScore = importance × exp(-0.1 × days_since_access) × log(2 + access_count)
+decayScore = importance × exp(-(0.1 / memory_strength) × days_since_access) × log(2 + access_count)
 ```
 
-- New, important memories score high immediately
-- Frequently-accessed memories stay near the top
-- Stale, unvisited memories naturally sink
+| Component | Role |
+|-----------|------|
+| `importance` | Fixed at creation (0–1); reflects intrinsic value |
+| `memory_strength` | Grows with `memory_reinforce` calls; modulates decay rate |
+| `days_since_access` | Updated on every retrieval (`last_accessed_at`) |
+| `access_count` | Incremented on every retrieval; reflects usage frequency |
+
+**Effective half-lives by strength:**
+
+| `memory_strength` | Decay rate (λ/strength) | Half-life |
+|-------------------|-------------------------|-----------|
+| 1.0 (default) | 0.100 /day | ~7 days |
+| 2.0 (1 reinforce) | 0.050 /day | ~14 days |
+| 5.0 (several) | 0.020 /day | ~35 days |
+| 10.0 (max) | 0.010 /day | ~69 days |
+
+**Reinforce growth (diminishing returns):**
+
+```
+newStrength = min(10.0, currentStrength × max(1.2, 1.8 - 0.2 × reinforcement_count))
+```
+
+1st call: ×1.8 → 2nd: ×1.6 → 3rd: ×1.4 → … → floor ×1.2
 
 Results from both layers are merged and deduplicated (project wins over global on identical content).
 
@@ -209,6 +241,7 @@ Matches are replaced with `[REDACTED]`; the write proceeds with sanitized conten
 | v1 | Initial schema: memories, session_context, conversation_history |
 | v2 | FTS5 virtual table + rowmap; back-fills index for existing memories |
 | v3 | memories: +citations, +source, +confidence; session_context: +current_episode_id; episodes table |
+| v4 | memories: +memory_strength, +reinforcement_count |
 
 Migrations run automatically on startup. Existing data is preserved.
 
@@ -247,6 +280,7 @@ bun run clean    # rm -rf dist node_modules
 - Paper: [Memory in the Age of AI Agents](https://arxiv.org/abs/2512.13564v2) — taxonomy this plugin is built on
 - Paper: [A-MEM (NeurIPS 2025)](https://arxiv.org/abs/2502.12110) — Zettelkasten memory evolution
 - Paper: [AWM (ICML 2025)](https://proceedings.mlr.press/v267/wang25bx.html) — workflow pattern extraction
+- Paper: [MemoryBank (AAAI 2024)](https://arxiv.org/abs/2305.10250) — Ebbinghaus strength model, inspiration for `memory_strength`
 - Paper: [Du 2026 Survey](https://arxiv.org/abs/2603.07670) — write–manage–read memory model
 - Blog: [GitHub Copilot Agentic Memory](https://github.blog/ai-and-ml/github-copilot/building-an-agentic-memory-system-for-github-copilot/) — citation-based fact storage
 - Repo: [Agent-Memory-Paper-List](https://github.com/Shichun-Liu/Agent-Memory-Paper-List)
