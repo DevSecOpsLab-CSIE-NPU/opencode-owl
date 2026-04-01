@@ -1,6 +1,8 @@
 /**
- * OpenCode Memory System Plugin v2
+ * OpenCode Memory System Plugin v3
  *
+ * Phase 3: Citation-based procedural memory (Issue #6),
+ *           Episodic reflection + episode tracking (Issue #7)
  * Phase 2: FTS5 search, global/project layer, decay ranking,
  *           privacy filter, schema versioning
  *
@@ -41,6 +43,32 @@ interface SessionContext {
   currentTask?: string;
   recentTools: string[];
   conversationSummary?: string;
+  currentEpisodeId?: string;
+}
+
+type MemorySource = "observed" | "human";
+type EpisodeOutcome = "success" | "partial" | "failure" | "abandoned" | "unknown";
+
+interface EpisodeAction {
+  tool: string;
+  summary: string;
+  timestamp: number;
+}
+
+interface Episode {
+  episodeId: string;
+  sessionId: string;
+  goal: string;
+  outcome: EpisodeOutcome;
+  actions: EpisodeAction[];
+  lessonsLearned: string[];
+  mistakes: string[];
+  importanceScore: number;
+  keywords: string[];
+  supersedes: string[];
+  confidence: number;
+  createdAt: number;
+  updatedAt: number;
 }
 
 // ============================================================
@@ -49,7 +77,7 @@ interface SessionContext {
 
 const VALID_MEMORY_TYPES: MemoryType[] = ["fact", "experience", "preference", "skill"];
 const MAX_CONTENT_BYTES = 10 * 1024; // 10KB
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const DECAY_LAMBDA = 0.1;          // decay rate per day
 const GLOBAL_SESSION_ID = "__global__";
 
@@ -164,6 +192,7 @@ class MemoryStore {
             current_task TEXT,
             recent_tools TEXT DEFAULT '[]',
             conversation_summary TEXT,
+            current_episode_id TEXT,
             updated_at INTEGER NOT NULL
           )
         `);
@@ -230,6 +259,38 @@ class MemoryStore {
           this.fts5Available = true;
         } catch {
           this.fts5Available = false;
+        }
+      }
+
+      if (current < 3) {
+        // Migration v3: citations/source/confidence on memories, episodes table
+        try {
+          // Gracefully add columns (SQLite ALTER TABLE ADD COLUMN is safe)
+          try { db.run(`ALTER TABLE memories ADD COLUMN citations TEXT DEFAULT '[]'`); } catch { /* already exists */ }
+          try { db.run(`ALTER TABLE memories ADD COLUMN source TEXT DEFAULT 'observed'`); } catch { /* already exists */ }
+          try { db.run(`ALTER TABLE memories ADD COLUMN confidence REAL DEFAULT 0.8`); } catch { /* already exists */ }
+          try { db.run(`ALTER TABLE session_context ADD COLUMN current_episode_id TEXT`); } catch { /* already exists */ }
+
+          db.run(`
+            CREATE TABLE IF NOT EXISTS episodes (
+              episode_id TEXT PRIMARY KEY,
+              session_id TEXT NOT NULL,
+              goal TEXT DEFAULT '',
+              outcome TEXT DEFAULT 'unknown',
+              actions TEXT DEFAULT '[]',
+              lessons_learned TEXT DEFAULT '[]',
+              mistakes TEXT DEFAULT '[]',
+              importance_score REAL DEFAULT 5.0,
+              keywords TEXT DEFAULT '[]',
+              supersedes TEXT DEFAULT '[]',
+              confidence REAL DEFAULT 0.8,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            )
+          `);
+          db.run(`CREATE INDEX IF NOT EXISTS idx_episodes_session ON episodes(session_id)`);
+        } catch (e) {
+          console.error("[Memory] Migration v3 error:", e);
         }
       }
 
@@ -634,6 +695,7 @@ class MemoryStore {
         currentTask: row[i("current_task")] as string | undefined,
         recentTools: JSON.parse((row[i("recent_tools")] as string) || "[]"),
         conversationSummary: row[i("conversation_summary")] as string | undefined,
+        currentEpisodeId: (row[i("current_episode_id")] as string | null) ?? undefined,
       };
     } catch (e) {
       console.error("[Memory] getSessionContext error:", e);
@@ -653,13 +715,14 @@ class MemoryStore {
         if (updates.currentTask !== undefined) { sets.push("current_task = ?"); params.push(updates.currentTask); }
         if (updates.recentTools !== undefined) { sets.push("recent_tools = ?"); params.push(JSON.stringify(updates.recentTools)); }
         if (updates.conversationSummary !== undefined) { sets.push("conversation_summary = ?"); params.push(updates.conversationSummary); }
+        if (updates.currentEpisodeId !== undefined) { sets.push("current_episode_id = ?"); params.push(updates.currentEpisodeId ?? null); }
         params.push(this.sessionId);
         db.run(`UPDATE session_context SET ${sets.join(", ")} WHERE session_id = ?`, params);
       } else {
         db.run(
-          `INSERT INTO session_context (session_id, current_task, recent_tools, conversation_summary, updated_at) VALUES (?,?,?,?,?)`,
+          `INSERT INTO session_context (session_id, current_task, recent_tools, conversation_summary, current_episode_id, updated_at) VALUES (?,?,?,?,?,?)`,
           [this.sessionId, updates.currentTask || null, JSON.stringify(updates.recentTools || []),
-           updates.conversationSummary || null, now] as RowParam[]
+           updates.conversationSummary || null, updates.currentEpisodeId || null, now] as RowParam[]
         );
       }
       const timerRef = { value: this.projectSaveTimer };
@@ -759,6 +822,209 @@ class MemoryStore {
     };
   }
 
+  addSkillMemory(params: {
+    name: string;
+    triggerPatterns: string[];
+    steps: string[];
+    applicability: string;
+    termination?: string;
+    citations?: string[];
+    importance?: number;
+  }): string {
+    const content = `SKILL: ${params.name}\nTriggers: ${params.triggerPatterns.join(", ")}\nApplies when: ${params.applicability}\nSteps:\n${params.steps.map((s, i) => `  ${i + 1}. ${s}`).join("\n")}${params.termination ? `\nDone when: ${params.termination}` : ""}`;
+    const db = this.projectDb;
+    if (!db) return "";
+    const id = `mem_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const now = Date.now();
+    const meta = {
+      skillName: params.name,
+      triggerPatterns: params.triggerPatterns,
+      steps: params.steps,
+      applicability: params.applicability,
+      termination: params.termination || "",
+      addedBy: "agent",
+    };
+    try {
+      db.run(
+        `INSERT INTO memories (id, session_id, type, content, metadata, importance, access_count, created_at, updated_at, last_accessed_at, citations, source, confidence)
+         VALUES (?, ?, 'skill', ?, ?, ?, 0, ?, ?, ?, ?, 'observed', 0.65)`,
+        [id, this.sessionId, content, JSON.stringify(meta), params.importance ?? 0.7,
+         now, now, now, JSON.stringify(params.citations ?? [])] as RowParam[]
+      );
+      this.insertFtsRow(db, id, this.sessionId, content);
+      this.forceSave("project");
+      return id;
+    } catch (e) {
+      console.error("[Memory] addSkillMemory error:", e);
+      return "";
+    }
+  }
+
+  approveSkill(id: string): boolean {
+    const db = this.projectDb;
+    if (!db) return false;
+    try {
+      db.run(
+        `UPDATE memories SET source = 'human', confidence = 0.9, updated_at = ? WHERE id = ? AND session_id = ? AND type = 'skill'`,
+        [Date.now(), id, this.sessionId] as RowParam[]
+      );
+      this.forceSave("project");
+      return db.getRowsModified() > 0;
+    } catch (e) {
+      console.error("[Memory] approveSkill error:", e);
+      return false;
+    }
+  }
+
+  validateCitations(): Array<{ memoryId: string; citation: string; valid: boolean }> {
+    const db = this.projectDb;
+    if (!db) return [];
+    const results: Array<{ memoryId: string; citation: string; valid: boolean }> = [];
+    try {
+      const res = db.exec(
+        `SELECT id, citations FROM memories WHERE session_id = ? AND citations != '[]'`,
+        [this.sessionId] as RowParam[]
+      );
+      if (res.length === 0) return [];
+      for (const row of res[0].values) {
+        const memId = row[0] as string;
+        const cits = JSON.parse((row[1] as string) || "[]") as string[];
+        for (const cit of cits) {
+          const filePath = cit.includes(":") ? cit.split(":")[0] : cit;
+          results.push({ memoryId: memId, citation: cit, valid: existsSync(filePath) });
+        }
+      }
+    } catch (e) {
+      console.error("[Memory] validateCitations error:", e);
+    }
+    return results;
+  }
+
+  startEpisode(goal: string): string {
+    const db = this.projectDb;
+    if (!db) return "";
+    const episodeId = `ep_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const now = Date.now();
+    try {
+      db.run(
+        `INSERT INTO episodes (episode_id, session_id, goal, outcome, actions, lessons_learned, mistakes, importance_score, keywords, supersedes, confidence, created_at, updated_at)
+         VALUES (?, ?, ?, 'unknown', '[]', '[]', '[]', 5.0, '[]', '[]', 0.8, ?, ?)`,
+        [episodeId, this.sessionId, goal, now, now] as RowParam[]
+      );
+      this.updateSessionContext({ currentEpisodeId: episodeId });
+      this.forceSave("project");
+      return episodeId;
+    } catch (e) {
+      console.error("[Memory] startEpisode error:", e);
+      return "";
+    }
+  }
+
+  endEpisode(params: {
+    outcome: EpisodeOutcome;
+    lessonsLearned?: string[];
+    mistakes?: string[];
+    importanceScore?: number;
+    keywords?: string[];
+  }): boolean {
+    const db = this.projectDb;
+    if (!db) return false;
+    const ctx = this.getSessionContext();
+    const episodeId = ctx?.currentEpisodeId;
+    if (!episodeId) return false;
+    const now = Date.now();
+    try {
+      db.run(
+        `UPDATE episodes SET outcome = ?, lessons_learned = ?, mistakes = ?, importance_score = ?, keywords = ?, updated_at = ? WHERE episode_id = ? AND session_id = ?`,
+        [
+          params.outcome,
+          JSON.stringify(params.lessonsLearned ?? []),
+          JSON.stringify(params.mistakes ?? []),
+          params.importanceScore ?? 5.0,
+          JSON.stringify(params.keywords ?? []),
+          now, episodeId, this.sessionId,
+        ] as RowParam[]
+      );
+
+      if (params.lessonsLearned && params.lessonsLearned.length > 0) {
+        for (const lesson of params.lessonsLearned) {
+          if (lesson.trim()) {
+            this.addMemory(
+              { type: "fact", content: `[lesson] ${lesson}`, metadata: { episodeId, source: "reflection" }, importance: 0.75 },
+              "project"
+            );
+          }
+        }
+      }
+
+      this.updateSessionContext({ currentEpisodeId: undefined });
+      this.forceSave("project");
+      return db.getRowsModified() > 0;
+    } catch (e) {
+      console.error("[Memory] endEpisode error:", e);
+      return false;
+    }
+  }
+
+  addActionToEpisode(toolName: string, summary: string): void {
+    const db = this.projectDb;
+    if (!db) return;
+    const ctx = this.getSessionContext();
+    const episodeId = ctx?.currentEpisodeId;
+    if (!episodeId) return;
+    try {
+      const res = db.exec(
+        `SELECT actions FROM episodes WHERE episode_id = ? AND session_id = ?`,
+        [episodeId, this.sessionId] as RowParam[]
+      );
+      if (res.length === 0 || res[0].values.length === 0) return;
+      const actions = JSON.parse((res[0].values[0][0] as string) || "[]") as EpisodeAction[];
+      actions.push({ tool: toolName, summary: summary.slice(0, 200), timestamp: Date.now() });
+      db.run(
+        `UPDATE episodes SET actions = ?, updated_at = ? WHERE episode_id = ? AND session_id = ?`,
+        [JSON.stringify(actions), Date.now(), episodeId, this.sessionId] as RowParam[]
+      );
+    } catch (e) {
+      console.error("[Memory] addActionToEpisode error:", e);
+    }
+  }
+
+  listEpisodes(limit = 10): Episode[] {
+    const db = this.projectDb;
+    if (!db) return [];
+    try {
+      const res = db.exec(
+        `SELECT * FROM episodes WHERE session_id = ? ORDER BY created_at DESC LIMIT ?`,
+        [this.sessionId, limit] as RowParam[]
+      );
+      if (res.length === 0) return [];
+      const cols = res[0].columns;
+      const i = (n: string) => cols.indexOf(n);
+      return res[0].values.map((row: unknown[]) => ({
+        episodeId: row[i("episode_id")] as string,
+        sessionId: row[i("session_id")] as string,
+        goal: row[i("goal")] as string,
+        outcome: row[i("outcome")] as EpisodeOutcome,
+        actions: JSON.parse((row[i("actions")] as string) || "[]"),
+        lessonsLearned: JSON.parse((row[i("lessons_learned")] as string) || "[]"),
+        mistakes: JSON.parse((row[i("mistakes")] as string) || "[]"),
+        importanceScore: row[i("importance_score")] as number,
+        keywords: JSON.parse((row[i("keywords")] as string) || "[]"),
+        supersedes: JSON.parse((row[i("supersedes")] as string) || "[]"),
+        confidence: row[i("confidence")] as number,
+        createdAt: row[i("created_at")] as number,
+        updatedAt: row[i("updated_at")] as number,
+      }));
+    } catch (e) {
+      console.error("[Memory] listEpisodes error:", e);
+      return [];
+    }
+  }
+
+  getCurrentEpisodeId(): string | undefined {
+    return this.getSessionContext()?.currentEpisodeId;
+  }
+
   close(): void {
     this.forceSave("both");
     this.projectDb?.close();
@@ -795,10 +1061,23 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
       const lines: string[] = [];
 
       if (memories.length > 0) {
-        lines.push("\n<agent_memory>", "## Relevant Memories");
-        for (const m of memories) {
-          const layerTag = m.layer === "global" ? " [global]" : "";
-          lines.push(`- [${m.type}${layerTag}] ${m.content}`);
+        const skills = memories.filter(m => m.type === "skill");
+        const others = memories.filter(m => m.type !== "skill");
+        lines.push("\n<agent_memory>");
+        if (others.length > 0) {
+          lines.push("## Memories");
+          for (const m of others) {
+            const tag = m.layer === "global" ? " [global]" : "";
+            lines.push(`- [${m.type}${tag}] ${m.content}`);
+          }
+        }
+        if (skills.length > 0) {
+          lines.push("## Skills");
+          for (const m of skills) {
+            const needsReview = (m.metadata as Record<string, unknown>)?.source === "observed" ? " ⚠️ unreviewed" : "";
+            lines.push(`### ${(m.metadata as Record<string, unknown>)?.skillName || m.id}${needsReview}`);
+            lines.push(m.content);
+          }
         }
         lines.push("</agent_memory>");
       }
@@ -831,7 +1110,9 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
       const significant = ["Edit", "Write", "Bash", "mcp_task"];
       if (significant.some(t => toolName.includes(t))) {
         const args = (h as { args?: { filePath?: string; path?: string } }).args;
-        store.upsertToolUsage(toolName, args?.filePath || args?.path);
+        const file = args?.filePath || args?.path;
+        store.upsertToolUsage(toolName, file);
+        store.addActionToEpisode(toolName, file ? `${toolName} on ${file}` : toolName);
       }
     },
 
@@ -922,6 +1203,106 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
           return store.promoteToProject(args.id)
             ? `Memory ${args.id} copied from global → project layer.`
             : `Memory ${args.id} not found in global layer.`;
+        },
+      }),
+
+      memory_add_skill: tool({
+        description: "Add a procedural skill memory (reusable workflow). Skills with confidence < 0.7 are shown as unreviewed in system prompt. Use memory_approve_skill to promote to reviewed.",
+        args: {
+          name: tool.schema.string().describe("Skill name, e.g. 'test-before-commit'"),
+          trigger_patterns: tool.schema.array(tool.schema.string()).describe("Phrases that should trigger this skill"),
+          steps: tool.schema.array(tool.schema.string()).describe("Ordered steps to execute"),
+          applicability: tool.schema.string().describe("When this skill applies"),
+          termination: tool.schema.string().optional().describe("Done condition"),
+          citations: tool.schema.array(tool.schema.string()).optional().describe("File:line references"),
+          importance: tool.schema.number().min(0).max(1).optional(),
+        },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sessionID || `project_${Buffer.from(directory).toString("base64").slice(0, 16)}`);
+          const id = store.addSkillMemory({
+            name: args.name,
+            triggerPatterns: args.trigger_patterns,
+            steps: args.steps,
+            applicability: args.applicability,
+            termination: args.termination,
+            citations: args.citations,
+            importance: args.importance,
+          });
+          return id ? `Skill "${args.name}" stored with ID: ${id} (unreviewed — use memory_approve_skill to confirm)` : "Failed to store skill.";
+        },
+      }),
+
+      memory_approve_skill: tool({
+        description: "Mark a skill memory as human-reviewed (confidence 0.9, source: human). Removes the unreviewed warning from system prompt.",
+        args: { id: tool.schema.string().describe("Skill memory ID") },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sessionID || `project_${Buffer.from(directory).toString("base64").slice(0, 16)}`);
+          return store.approveSkill(args.id) ? `Skill ${args.id} approved (confidence: 0.9).` : `Skill ${args.id} not found.`;
+        },
+      }),
+
+      memory_validate_citations: tool({
+        description: "Check all citation file paths in memory are still valid. Returns stale citations.",
+        args: {},
+        async execute(_, { sessionID }) {
+          store.setSessionId(sessionID || `project_${Buffer.from(directory).toString("base64").slice(0, 16)}`);
+          const results = store.validateCitations();
+          if (results.length === 0) return "No citations found.";
+          const stale = results.filter(r => !r.valid);
+          const valid = results.filter(r => r.valid);
+          return [
+            `Citations: ${results.length} total, ${valid.length} valid, ${stale.length} stale`,
+            ...stale.map(r => `  ✗ ${r.citation} (memory: ${r.memoryId})`),
+          ].join("\n");
+        },
+      }),
+
+      memory_start_episode: tool({
+        description: "Start tracking a new episode (task attempt). Automatically records subsequent tool calls as episode actions.",
+        args: { goal: tool.schema.string().describe("What you're trying to accomplish") },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sessionID || `project_${Buffer.from(directory).toString("base64").slice(0, 16)}`);
+          const id = store.startEpisode(args.goal);
+          return id ? `Episode started: ${id}\nGoal: ${args.goal}\nCall memory_end_episode when done.` : "Failed to start episode.";
+        },
+      }),
+
+      memory_end_episode: tool({
+        description: "Finalize the current episode. Lessons learned are automatically promoted to fact memories.",
+        args: {
+          outcome: tool.schema.enum(["success", "partial", "failure", "abandoned"]),
+          lessons_learned: tool.schema.array(tool.schema.string()).optional().describe("High-level insights to remember"),
+          mistakes: tool.schema.array(tool.schema.string()).optional().describe("Errors made (include what went wrong)"),
+          importance_score: tool.schema.number().min(1).max(10).optional().describe("How important was this episode (1-10)"),
+          keywords: tool.schema.array(tool.schema.string()).optional(),
+        },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sessionID || `project_${Buffer.from(directory).toString("base64").slice(0, 16)}`);
+          const ok = store.endEpisode({
+            outcome: args.outcome as EpisodeOutcome,
+            lessonsLearned: args.lessons_learned,
+            mistakes: args.mistakes,
+            importanceScore: args.importance_score,
+            keywords: args.keywords,
+          });
+          if (!ok) return "No active episode found. Use memory_start_episode first.";
+          const promoted = (args.lessons_learned?.length ?? 0);
+          return `Episode closed (${args.outcome}). ${promoted} lessons promoted to memory.`;
+        },
+      }),
+
+      memory_list_episodes: tool({
+        description: "List recent episodes for this session.",
+        args: { limit: tool.schema.number().optional().describe("Max results (default 10)") },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sessionID || `project_${Buffer.from(directory).toString("base64").slice(0, 16)}`);
+          const eps = store.listEpisodes(args.limit || 10);
+          if (eps.length === 0) return "No episodes recorded yet.";
+          return eps.map(ep => {
+            const actions = ep.actions.length;
+            const lessons = ep.lessonsLearned.length;
+            return `[${ep.outcome}] ${ep.episodeId}  goal: "${ep.goal.slice(0, 60)}"  actions:${actions}  lessons:${lessons}`;
+          }).join("\n");
         },
       }),
 
