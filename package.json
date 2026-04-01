@@ -13,18 +13,17 @@
     "install.sh"
   ],
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target node && cp node_modules/sql.js/dist/sql-wasm.wasm dist/",
+    "build": "bun build src/index.ts --outdir dist --target node",
     "dev": "bun build src/index.ts --outdir dist --target node --watch",
     "install:plugin": "./install.sh",
     "clean": "rm -rf dist node_modules"
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.2.15",
-    "sql.js": "^1.14.0"
+    "sqlite-vec": "^0.1.9"
   },
   "devDependencies": {
     "@types/node": "^22.13.9",
-    "@types/sql.js": "^1.4.11",
     "bun-types": "^1.2.4",
     "typescript": "^5.8.2"
   },
