@@ -24,6 +24,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.13.9",
+    "@types/sql.js": "^1.4.11",
     "bun-types": "^1.2.4",
     "typescript": "^5.8.2"
   },
