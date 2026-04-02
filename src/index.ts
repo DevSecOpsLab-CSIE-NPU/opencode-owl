@@ -1,5 +1,12 @@
 /**
- * OpenCode Memory System Plugin v6
+ * OpenCode Memory System Plugin v7
+ *
+ * Phase 7: Version Update Flow
+ *   - VersionChecker: GitHub release comparison + semver parsing
+ *   - Startup notification: console + system prompt (once per version)
+ *   - Pre-migration backup: .db → .db.bak before schema changes
+ *   - memory_check_update: manual version check tool
+ *   - memory_version: display current package + schema version
  *
  * Phase 6: Forgetting Mechanism (Issue #12)
  *   - archived_memories table: soft-delete low-score/old memories
@@ -28,7 +35,7 @@ import { tool } from "@opencode-ai/plugin";
 import { Database } from "bun:sqlite";
 import * as sqliteVec from "sqlite-vec";
 import { join } from "path";
-import { mkdirSync, existsSync } from "fs";
+import { mkdirSync, existsSync, copyFileSync } from "fs";
 import { homedir } from "os";
 
 type MemoryType   = "fact" | "experience" | "preference" | "skill";
@@ -95,6 +102,15 @@ interface ArchivedMemoryRow extends MemoryRow {
   archive_reason: string | null;
 }
 
+interface UpdateInfo {
+  currentVersion: string;
+  latestVersion: string;
+  updateAvailable: boolean;
+  releaseType: "major" | "minor" | "patch" | "none";
+  releaseNotes: string;
+  releaseUrl: string;
+}
+
 interface SessionContextRow {
   session_id: string; current_task: string | null;
   recent_tools: string; conversation_summary: string | null;
@@ -113,7 +129,9 @@ const MAX_CONTENT_BYTES  = 10 * 1024;
 const SCHEMA_VERSION     = 6;
 const DECAY_LAMBDA       = 0.1;
 const GLOBAL_SESSION_ID  = "__global__";
-const EMBED_DIM          = 768; // nomic-embed-text output dimension
+const EMBED_DIM          = 768;
+const PACKAGE_VERSION    = "0.9.1";
+const GITHUB_RELEASES_URL = "https://api.github.com/repos/DevSecOpsLab-CSIE-NPU/opencode-owl/releases/latest";
 
 const SENSITIVE_PATTERNS: readonly RegExp[] = [
   /sk-[a-zA-Z0-9]{20,}/g,
@@ -151,6 +169,74 @@ function rrfMerge(listA: string[], listB: string[], k = 60): string[] {
   listA.forEach((id, rank) => scores.set(id, (scores.get(id) ?? 0) + 1 / (k + rank + 1)));
   listB.forEach((id, rank) => scores.set(id, (scores.get(id) ?? 0) + 1 / (k + rank + 1)));
   return [...scores.entries()].sort((a, b) => b[1] - a[1]).map(([id]) => id);
+}
+
+class VersionChecker {
+  private readonly currentVersion: string;
+  private latestCache: UpdateInfo | null = null;
+  private lastChecked = 0;
+
+  constructor(currentVersion: string) {
+    this.currentVersion = currentVersion;
+  }
+
+  parseSemver(version: string): { major: number; minor: number; patch: number } {
+    const clean = version.replace(/^v/, "");
+    const parts = clean.split(".").map(Number);
+    return { major: parts[0] ?? 0, minor: parts[1] ?? 0, patch: parts[2] ?? 0 };
+  }
+
+  compareVersions(current: string, latest: string): "major" | "minor" | "patch" | "none" {
+    const c = this.parseSemver(current);
+    const l = this.parseSemver(latest);
+    if (l.major > c.major) return "major";
+    if (l.minor > c.minor) return "minor";
+    if (l.patch > c.patch) return "patch";
+    return "none";
+  }
+
+  async check(): Promise<UpdateInfo> {
+    if (this.latestCache && Date.now() - this.lastChecked < 3_600_000) return this.latestCache;
+
+    try {
+      const resp = await fetch(GITHUB_RELEASES_URL, {
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!resp.ok) {
+        this.latestCache = { currentVersion: this.currentVersion, latestVersion: this.currentVersion, updateAvailable: false, releaseType: "none", releaseNotes: "", releaseUrl: "" };
+        this.lastChecked = Date.now();
+        return this.latestCache;
+      }
+      const data = await resp.json() as { tag_name: string; body: string; html_url: string };
+      const latestVersion = data.tag_name.replace(/^v/, "");
+      const releaseType = this.compareVersions(this.currentVersion, latestVersion);
+      const updateAvailable = releaseType !== "none";
+
+      this.latestCache = {
+        currentVersion: this.currentVersion,
+        latestVersion,
+        updateAvailable,
+        releaseType,
+        releaseNotes: data.body ?? "",
+        releaseUrl: data.html_url ?? "",
+      };
+    } catch {
+      this.latestCache = { currentVersion: this.currentVersion, latestVersion: this.currentVersion, updateAvailable: false, releaseType: "none", releaseNotes: "", releaseUrl: "" };
+    }
+    this.lastChecked = Date.now();
+    return this.latestCache;
+  }
+
+  getNotification(info: UpdateInfo): string | null {
+    if (!info.updateAvailable) return null;
+    const typeLabel = info.releaseType === "major" ? "MAJOR" : info.releaseType === "minor" ? "MINOR" : "PATCH";
+    const changelog = info.releaseNotes.split("\n").filter(l => l.trim().startsWith("-")).slice(0, 5).join("\n");
+    return [
+      `Update available: ${info.currentVersion} → ${info.latestVersion} (${typeLabel})`,
+      changelog ? `Changelog:\n${changelog}` : "",
+      `Release: ${info.releaseUrl}`,
+    ].filter(Boolean).join("\n");
+  }
 }
 
 class EmbeddingService {
@@ -220,17 +306,27 @@ class MemoryStore {
       this.setupMacOSSQLite();
 
       this.ensureDir(this.projectDbPath);
+      this.createBackup(this.projectDbPath);
       this.projectDb = new Database(this.projectDbPath);
       this.tryLoadVec(this.projectDb);
       this.initSchemaForDb(this.projectDb, false);
 
       this.ensureDir(this.globalDbPath);
+      this.createBackup(this.globalDbPath);
       this.globalDb = new Database(this.globalDbPath);
       this.tryLoadVec(this.globalDb);
       this.initSchemaForDb(this.globalDb, true);
     } catch (err) {
       console.error("[Memory] Initialization failed:", err);
     }
+  }
+
+  private createBackup(dbPath: string): void {
+    if (!existsSync(dbPath)) return;
+    const backupPath = `${dbPath}.bak`;
+    try {
+      copyFileSync(dbPath, backupPath);
+    } catch { /* ignore — backup is best-effort */ }
   }
 
   private setupMacOSSQLite(): void {
@@ -1403,9 +1499,19 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
 
   const store = new MemoryStore(projectDbPath, globalDbPath);
   store.initialize();
-  console.log(`[Memory] v6 initialized | project: ${projectDbPath} | global: ${globalDbPath}`);
+  console.log(`[Memory] v${PACKAGE_VERSION} (schema v${SCHEMA_VERSION}) initialized | project: ${projectDbPath} | global: ${globalDbPath}`);
 
-  setImmediate(() => {
+  const versionChecker = new VersionChecker(PACKAGE_VERSION);
+  let updateNotification: string | null = null;
+  let updateShownInPrompt = false;
+
+  setImmediate(async () => {
+    try {
+      const updateInfo = await versionChecker.check();
+      updateNotification = versionChecker.getNotification(updateInfo);
+      if (updateNotification) console.log(`[Memory] ${updateNotification}`);
+    } catch { /* ignore */ }
+
     try {
       const archiveResult = store.archiveOldMemories();
       const expResult     = store.cleanupExperiences();
@@ -1464,6 +1570,10 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
       if (ctx?.currentTask)            lines.push(`\n<current_task>${ctx.currentTask}</current_task>`);
       if (ctx?.recentTools?.length)    lines.push(`\n<recent_tools>${ctx.recentTools.slice(-5).join(", ")}</recent_tools>`);
       if (lines.length > 0) output.system.push(...lines);
+      if (updateNotification && !updateShownInPrompt) {
+        output.system.push(`\n<update_available>\n${updateNotification}\n</update_available>`);
+        updateShownInPrompt = true;
+      }
     },
 
     "chat.message": async (h, output) => {
@@ -1814,6 +1924,45 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
             ? new Date(meta.generatedAt as number).toISOString()
             : "unknown";
           return `Latest auto-reflection (generated: ${generatedAt}, importance: ${mem.importance.toFixed(2)}):\n\n${mem.content}`;
+        },
+      }),
+
+      memory_version: tool({
+        description: "Show current plugin version, schema version, and update status.",
+        args: {},
+        async execute(_, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const info = await versionChecker.check();
+          const lines = [
+            `Package:  v${info.currentVersion}`,
+            `Schema:   v${SCHEMA_VERSION}`,
+            `Latest:   v${info.latestVersion}`,
+            info.updateAvailable
+              ? `Update available: ${info.releaseType.toUpperCase()} (${info.releaseUrl})`
+              : "Up to date.",
+          ];
+          return lines.join("\n");
+        },
+      }),
+
+      memory_check_update: tool({
+        description: "Manually check for available updates from GitHub releases.",
+        args: {},
+        async execute(_, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const info = await versionChecker.check();
+          if (!info.updateAvailable) return `Already up to date (v${info.currentVersion}).`;
+          const typeLabel = info.releaseType.toUpperCase();
+          const changelog = info.releaseNotes
+            .split("\n")
+            .filter(l => l.trim().startsWith("-"))
+            .slice(0, 8)
+            .join("\n");
+          return [
+            `Update available: v${info.currentVersion} → v${info.latestVersion} (${typeLabel})`,
+            changelog ? `\nChangelog:\n${changelog}` : "",
+            `Release: ${info.releaseUrl}`,
+          ].filter(Boolean).join("\n");
         },
       }),
     },

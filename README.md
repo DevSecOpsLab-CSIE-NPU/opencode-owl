@@ -89,6 +89,16 @@ Restart OpenCode. The plugin initializes both databases on first run.
 | `memory_stats` | Project + global memory counts, by-type breakdown |
 | `memory_set_task` | Set current task context (shown in system prompt) |
 | `memory_status` | One-line memory system summary |
+| `memory_version` | Show current package version, schema version, and update status |
+| `memory_check_update` | Manually check for available updates from GitHub releases |
+
+### Archive Management
+
+| Tool | Description |
+|------|-------------|
+| `memory_archive` | Trigger archival of low-score/old memories |
+| `memory_list_archived` | List archived memories with date, reason, and preview |
+| `memory_restore` | Restore an archived memory back to active |
 
 ## Usage Examples
 
@@ -273,8 +283,9 @@ Matches are replaced with `[REDACTED]`; the write proceeds with sanitized conten
 | v3 | memories: +citations, +source, +confidence; session_context: +current_episode_id; episodes table |
 | v4 | memories: +memory_strength, +reinforcement_count |
 | v5 | memories: +embedding BLOB; memory_vec vec0 virtual table; memory_vec_rowmap |
+| v6 | archived_memories table; auto-archival of low-score/old memories |
 
-Migrations run automatically on startup. Existing data is preserved.
+Migrations run automatically on startup. Pre-migration backup (`.db.bak`) is created before any schema change.
 
 ## Troubleshooting
 
