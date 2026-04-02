@@ -6,6 +6,10 @@ Based on **"Memory in the Age of AI Agents: A Survey"** (arXiv:2512.13564v2) and
 
 ## Features
 
+- **sqlite-vec KNN Search** — 768-dim cosine distance vector search via vec0 virtual table
+- **RRF Hybrid Search** — Reciprocal Rank Fusion merges FTS5 BM25 + vector KNN results (k=60)
+- **EmbeddingService** — Ollama nomic-embed-text integration with graceful FTS5-only fallback
+- **Async Vector Generation** — Non-blocking embedding via setImmediate() on add/update
 - **FTS5 Full-Text Search** — BM25-ranked search replaces `LIKE` scans; graceful fallback when unavailable
 - **Memory Decay Ranking** — `score = importance × exp(-(λ/strength) × t) × log(2 + access_count)` surfaces actively-used memories
 - **Memory Reinforce** — FSRS-inspired multiplicative strength boost with diminishing returns; slows decay rate per reinforcement
@@ -13,7 +17,7 @@ Based on **"Memory in the Age of AI Agents: A Survey"** (arXiv:2512.13564v2) and
 - **Privacy Filter** — regex redaction of API keys, tokens, and credentials before writing to global layer
 - **Procedural Skill Memory** — structured workflows with trigger patterns, step lists, and citation verification
 - **Episode Tracking** — record task attempts with goal/outcome/actions; lessons auto-promote to persistent facts
-- **Schema Versioning** — `schema_version` table + automatic migrations (v1 → v2 → v3 → v4)
+- **Schema Versioning** — `schema_version` table + automatic migrations (v1 → v2 → v3 → v4 → v5)
 - **CRUD Tools** — full create/read/update/delete for agent-managed memories
 
 ## Quick Install
@@ -139,13 +143,13 @@ memory_reinforce(id="mem_1234_abcd")
   global.db          ← Global layer (cross-project user preferences)
 ```
 
-Both databases use SQLite via sql.js (pure-JS WASM, no native extensions required).
+Both databases use bun:sqlite (native SQLite with WAL mode, extension support).
 
 ## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                  OpenCode Memory Plugin v4                   │
+│                  OpenCode Memory Plugin v5                   │
 ├──────────────────────────────────────────────────────────────┤
 │  Hooks                                                       │
 │  ├── chat.system.transform  → inject relevant memories       │
@@ -160,13 +164,19 @@ Both databases use SQLite via sql.js (pure-JS WASM, no native extensions require
 │  └── Project DB  ~/.local/share/opencode/memory/memory.db    │
 │        per-session facts, skills, experiences, episodes      │
 ├──────────────────────────────────────────────────────────────┤
-│  Schema (v3)                                                 │
+│  Vector Components (v5)                                      │
+│  ├── EmbeddingService  Ollama nomic-embed-text integration   │
+│  └── vec0 Engine       sqlite-vec KNN vector search          │
+├──────────────────────────────────────────────────────────────┤
+│  Schema (v5)                                                 │
 │  ├── memories    id, type, content, citations, source,       │
-│  │               confidence, importance, decay metadata      │
+│  │               confidence, importance, decay metadata,     │
+│  │               embedding (BLOB)                            │
 │  ├── episodes    goal, outcome, actions[], lessons[],        │
 │  │               mistakes[], importance_score, confidence    │
+│  ├── memory_vec  vec0 virtual table (768-dim, cosine)        │
 │  ├── memory_fts  FTS5 virtual table (porter tokenizer)       │
-│  ├── memory_fts_rowmap  FTS5 ↔ memory ID mapping            │
+│  ├── rowmaps     memory_fts_rowmap, memory_vec_rowmap        │
 │  ├── session_context    current task, recent tools,          │
 │  │                      current_episode_id                   │
 │  ├── conversation_history  last 50 messages per session      │
@@ -187,10 +197,19 @@ Skills with `source: "observed"` and `confidence < 0.7` are shown with a ⚠️ 
 
 ## Retrieval Ranking
 
-All query results are scored and sorted by:
+Memory retrieval uses **RRF (Reciprocal Rank Fusion)** to merge results from text-based and semantic searches:
+
+1. **Step 1: FTS5 BM25 search** — Lexical match on keywords and phrases.
+2. **Step 2: Vector KNN search** — Semantic match using cosine distance (if Ollama is available).
+3. **Step 3: RRF merge** — Scores are combined using `score = Σ 1/(60 + rank + 1)`.
+4. **Step 4: Decay score** — Final ranking applies the temporal decay model.
+
+### Decay Model
+
+All merged results are final-scored by:
 
 ```
-decayScore = importance × exp(-(0.1 / memory_strength) × days_since_access) × log(2 + access_count)
+decayScore = rrfScore × importance × exp(-(0.1 / memory_strength) × days_since_access) × log(2 + access_count)
 ```
 
 | Component | Role |
@@ -219,6 +238,17 @@ newStrength = min(10.0, currentStrength × max(1.2, 1.8 - 0.2 × reinforcement_c
 
 Results from both layers are merged and deduplicated (project wins over global on identical content).
 
+## Embedding Configuration
+
+The system integrates with **Ollama** for local vector generation:
+
+- **Endpoint**: `http://localhost:11434/api/embed`
+- **Model**: `nomic-embed-text` (768-dim)
+- **Prefixes**:
+  - `passage:` used for storing memories
+  - `query:` used for searching memories
+- **Fallback**: Gracefully falls back to FTS5-only keyword search if Ollama is unavailable or the model is not pulled.
+
 ## Privacy Filter
 
 Before writing to the **global layer**, content is scanned against:
@@ -242,6 +272,7 @@ Matches are replaced with `[REDACTED]`; the write proceeds with sanitized conten
 | v2 | FTS5 virtual table + rowmap; back-fills index for existing memories |
 | v3 | memories: +citations, +source, +confidence; session_context: +current_episode_id; episodes table |
 | v4 | memories: +memory_strength, +reinforcement_count |
+| v5 | memories: +embedding BLOB; memory_vec vec0 virtual table; memory_vec_rowmap |
 
 Migrations run automatically on startup. Existing data is preserved.
 
@@ -260,11 +291,59 @@ Migrations run automatically on startup. Existing data is preserved.
 1. Check write permissions: `ls -la ~/.local/share/opencode/memory/`
 2. `memory_status()` reports DB paths on init.
 
-**sql.js WASM missing**
+**Vector search not working**
+1. Ensure Ollama is running: `curl http://localhost:11434/api/tags`
+2. Verify model is available: `ollama pull nomic-embed-text`
+3. Check `memory_status()` — if `vectorAvailable` is false, system defaults to FTS5-only search.
+
+## MCP Server Mode
+
+Expose all memory tools as an HTTP JSON-RPC 2.0 server so any tool — not just OpenCode — can access memories.
+
 ```bash
-cp node_modules/sql.js/dist/sql-wasm.wasm dist/
-cp dist/sql-wasm.wasm ~/.config/opencode/plugins/memory-system/
+bun run mcp
 ```
+
+Default port: **3100** — override with `MCP_PORT` env var.
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/rpc` | JSON-RPC 2.0 dispatch |
+| `GET`  | `/health` | `{ status: "ok", version: "v5" }` |
+| `GET`  | `/tools` | List all available tool names |
+
+### JSON-RPC 2.0 Request Format
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "memory_query",
+  "params": { "query": "test runner", "limit": 5 },
+  "id": 1
+}
+```
+
+All methods accept an optional `"session_id"` param. If omitted, the session defaults to the server's CWD (same logic as the plugin).
+
+### Example Calls
+
+```bash
+curl -s -X POST http://localhost:3100/rpc \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"memory_query","params":{"query":"bun test"},"id":1}'
+
+curl -s -X POST http://localhost:3100/rpc \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"memory_add","params":{"type":"fact","content":"This project uses bun test","importance":0.9},"id":2}'
+
+curl -s http://localhost:3100/health
+```
+
+Available methods: `memory_query`, `memory_add`, `memory_list`, `memory_update`, `memory_delete`, `memory_reinforce`, `memory_add_skill`, `memory_approve_skill`, `memory_validate_citations`, `memory_start_episode`, `memory_end_episode`, `memory_list_episodes`, `memory_stats`, `memory_status`
+
+The server opens the same SQLite databases as the OpenCode plugin, so memories are shared between both.
 
 ## Development
 

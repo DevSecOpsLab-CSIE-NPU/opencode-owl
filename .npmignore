@@ -1,0 +1,13 @@
+# NPM publish artifacts
+.git/
+.github/
+.sisyphus/
+node_modules/
+src/
+*.ts
+tsconfig.json
+bun.lockb
+pnpm-lock.yaml
+yarn.lock
+.env
+*.log

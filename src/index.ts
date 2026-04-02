@@ -1,5 +1,12 @@
 /**
- * OpenCode Memory System Plugin v5
+ * OpenCode Memory System Plugin v6
+ *
+ * Phase 6: Forgetting Mechanism (Issue #12)
+ *   - archived_memories table: soft-delete low-score/old memories
+ *   - archiveOldMemories(): decay < 0.05 AND access < 2 AND age > 30d
+ *   - cleanupExperiences(): experience-type memories older than 7 days
+ *   - memory_archive, memory_list_archived, memory_restore tools
+ *   - Auto-triggered archival on startup (non-blocking)
  *
  * Phase 5: sql.js → bun:sqlite migration + sqlite-vec hybrid search (Issue #10)
  *   - bun:sqlite: native SQLite, WAL mode, extension support
@@ -83,6 +90,11 @@ interface MemoryRow {
   memory_strength: number | null; reinforcement_count: number | null;
 }
 
+interface ArchivedMemoryRow extends MemoryRow {
+  archived_at: number;
+  archive_reason: string | null;
+}
+
 interface SessionContextRow {
   session_id: string; current_task: string | null;
   recent_tools: string; conversation_summary: string | null;
@@ -98,7 +110,7 @@ interface EpisodeRow {
 
 const VALID_MEMORY_TYPES: MemoryType[] = ["fact", "experience", "preference", "skill"];
 const MAX_CONTENT_BYTES  = 10 * 1024;
-const SCHEMA_VERSION     = 5;
+const SCHEMA_VERSION     = 6;
 const DECAY_LAMBDA       = 0.1;
 const GLOBAL_SESSION_ID  = "__global__";
 const EMBED_DIM          = 768; // nomic-embed-text output dimension
@@ -360,6 +372,29 @@ class MemoryStore {
             db.exec("CREATE INDEX IF NOT EXISTS idx_vec_rowmap_session ON memory_vec_rowmap(session_id)");
           }
         } catch (e) { console.error("[Memory] Migration v5 error:", e); }
+      }
+
+      if (current < 6) {
+        try {
+          db.exec(`
+            CREATE TABLE IF NOT EXISTS archived_memories (
+              id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+              type TEXT NOT NULL, content TEXT NOT NULL,
+              metadata TEXT DEFAULT '{}', importance REAL DEFAULT 0.5,
+              access_count INTEGER DEFAULT 0,
+              created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+              last_accessed_at INTEGER NOT NULL,
+              citations TEXT, source TEXT, confidence REAL,
+              memory_strength REAL, reinforcement_count INTEGER,
+              embedding BLOB,
+              archived_at INTEGER NOT NULL,
+              archive_reason TEXT
+            )
+          `);
+          db.exec("CREATE INDEX IF NOT EXISTS idx_archived_session ON archived_memories(session_id)");
+          db.exec("CREATE INDEX IF NOT EXISTS idx_archived_type ON archived_memories(type)");
+          db.exec("CREATE INDEX IF NOT EXISTS idx_archived_at ON archived_memories(archived_at)");
+        } catch (e) { console.error("[Memory] Migration v6 error:", e); }
       }
 
       if (current === 0) {
@@ -774,6 +809,146 @@ class MemoryStore {
     return notFound;
   }
 
+  archiveOldMemories(): { projectArchived: number; globalArchived: number } {
+    const archiveFromDb = (db: Database): number => {
+      let count = 0;
+      try {
+        const thirtyDaysAgo = Date.now() - 30 * 86_400_000;
+        const rows = db.prepare(`
+          SELECT * FROM memories WHERE access_count < 2 AND created_at < ?
+        `).all(thirtyDaysAgo) as MemoryRow[];
+        const now = Date.now();
+        for (const row of rows) {
+          const entry = this.rowToEntry(row);
+          const decayScore = computeDecayScore(
+            entry.importance, entry.lastAccessedAt, entry.accessCount, entry.memoryStrength
+          );
+          if (decayScore < 0.05) {
+            try {
+              db.prepare(`
+                INSERT OR REPLACE INTO archived_memories (
+                  id, session_id, type, content, metadata, importance,
+                  access_count, created_at, updated_at, last_accessed_at,
+                  citations, source, confidence, memory_strength, reinforcement_count,
+                  embedding, archived_at, archive_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              `).run(
+                row.id, row.session_id, row.type, row.content, row.metadata,
+                row.importance, row.access_count, row.created_at, row.updated_at,
+                row.last_accessed_at, row.citations ?? null, row.source ?? null,
+                row.confidence ?? null, row.memory_strength ?? null,
+                row.reinforcement_count ?? null,
+                (row as unknown as { embedding?: Buffer | null }).embedding ?? null,
+                now, `auto:decay_score=${decayScore.toFixed(4)}`
+              );
+              db.prepare("DELETE FROM memories WHERE id = ?").run(row.id);
+              this.deleteFtsRow(db, row.id);
+              this.deleteVecRow(db, row.id);
+              count++;
+            } catch (e) { console.error("[Memory] archiveOldMemories row error:", e); }
+          }
+        }
+      } catch (e) { console.error("[Memory] archiveOldMemories error:", e); }
+      return count;
+    };
+    const projectArchived = this.projectDb ? archiveFromDb(this.projectDb) : 0;
+    const globalArchived  = this.globalDb  ? archiveFromDb(this.globalDb)  : 0;
+    return { projectArchived, globalArchived };
+  }
+
+  cleanupExperiences(): { projectArchived: number } {
+    const db = this.projectDb;
+    if (!db) return { projectArchived: 0 };
+    let projectArchived = 0;
+    try {
+      const sevenDaysAgo = Date.now() - 7 * 86_400_000;
+      const rows = db.prepare(`
+        SELECT * FROM memories WHERE type = 'experience' AND created_at < ?
+      `).all(sevenDaysAgo) as MemoryRow[];
+      const now = Date.now();
+      for (const row of rows) {
+        try {
+          db.prepare(`
+            INSERT OR REPLACE INTO archived_memories (
+              id, session_id, type, content, metadata, importance,
+              access_count, created_at, updated_at, last_accessed_at,
+              citations, source, confidence, memory_strength, reinforcement_count,
+              embedding, archived_at, archive_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            row.id, row.session_id, row.type, row.content, row.metadata,
+            row.importance, row.access_count, row.created_at, row.updated_at,
+            row.last_accessed_at, row.citations ?? null, row.source ?? null,
+            row.confidence ?? null, row.memory_strength ?? null,
+            row.reinforcement_count ?? null,
+            (row as unknown as { embedding?: Buffer | null }).embedding ?? null,
+            now, "auto:experience_cleanup"
+          );
+          db.prepare("DELETE FROM memories WHERE id = ?").run(row.id);
+          this.deleteFtsRow(db, row.id);
+          this.deleteVecRow(db, row.id);
+          projectArchived++;
+        } catch (e) { console.error("[Memory] cleanupExperiences row error:", e); }
+      }
+    } catch (e) { console.error("[Memory] cleanupExperiences error:", e); }
+    return { projectArchived };
+  }
+
+  listArchivedMemories(options: { limit?: number; layer?: MemoryLayer; type?: string } = {}):
+    Array<MemoryEntry & { archivedAt: number; archiveReason: string | null }> {
+    const limit = options.limit ?? 20;
+    const results: Array<MemoryEntry & { archivedAt: number; archiveReason: string | null }> = [];
+
+    const fetch = (db: Database | null, sessId: string, layer: MemoryLayer) => {
+      if (!db) return;
+      let sql = "SELECT * FROM archived_memories WHERE session_id = ?";
+      const params: RowParam[] = [sessId];
+      if (options.type) { sql += " AND type = ?"; params.push(options.type); }
+      sql += " ORDER BY archived_at DESC LIMIT ?";
+      params.push(limit);
+      try {
+        const rows = db.prepare(sql).all(...params) as ArchivedMemoryRow[];
+        for (const r of rows) {
+          results.push({ ...this.rowToEntry(r), layer, archivedAt: r.archived_at, archiveReason: r.archive_reason });
+        }
+      } catch (e) { console.error("[Memory] listArchivedMemories error:", e); }
+    };
+
+    if (!options.layer || options.layer === "project") fetch(this.projectDb, this.sessionId, "project");
+    if (!options.layer || options.layer === "global")  fetch(this.globalDb, GLOBAL_SESSION_ID, "global");
+
+    results.sort((a, b) => b.archivedAt - a.archivedAt);
+    return results.slice(0, limit);
+  }
+
+  restoreMemory(id: string): boolean {
+    for (const [db, sessId, _layer] of this.allDbs()) {
+      try {
+        const row = db.prepare("SELECT * FROM archived_memories WHERE id = ? AND session_id = ?")
+          .get(id, sessId) as ArchivedMemoryRow | null;
+        if (!row) continue;
+        const now = Date.now();
+        db.prepare(`
+          INSERT OR REPLACE INTO memories (
+            id, session_id, type, content, metadata, importance,
+            access_count, created_at, updated_at, last_accessed_at,
+            citations, source, confidence, memory_strength, reinforcement_count
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          row.id, row.session_id, row.type, row.content, row.metadata,
+          row.importance, row.access_count, row.created_at, now,
+          now, row.citations ?? null, row.source ?? null,
+          row.confidence ?? null, row.memory_strength ?? null,
+          row.reinforcement_count ?? null
+        );
+        this.insertFtsRow(db, row.id, sessId, row.content);
+        db.prepare("DELETE FROM archived_memories WHERE id = ? AND session_id = ?").run(id, sessId);
+        return true;
+      } catch (e) { console.error("[Memory] restoreMemory error:", e); }
+    }
+    return false;
+  }
+
   private allDbs(): Array<[Database, string, MemoryLayer]> {
     const list: Array<[Database, string, MemoryLayer]> = [];
     if (this.projectDb) list.push([this.projectDb, this.sessionId, "project"]);
@@ -1018,6 +1193,198 @@ class MemoryStore {
     };
   }
 
+  buildContextQuery(
+    recentConversations: Array<{ role: string; content: string; timestamp: number }>,
+    currentTask?: string,
+    recentTools?: string[]
+  ): string {
+    const STOP_WORDS = new Set([
+      "a","an","the","and","or","but","in","on","at","to","for","of","with","by","from",
+      "is","are","was","were","be","been","being","have","has","had","do","does","did",
+      "will","would","could","should","may","might","can","this","that","these","those",
+      "i","me","my","we","our","you","your","he","she","it","they","them","their",
+      "what","which","who","how","when","where","why","not","no","yes","so","if","then",
+      "than","as","up","out","about","into","through","over","after","before","just",
+      "also","use","used","using","make","made","get","got","set","run","let","new",
+      "all","more","some","any","each","both","here","there","now","only","very","much",
+      "like","need","want","know","see","try","look","go","come","back","while","please",
+      "thanks","okay","sure","ok","its","one","two","three","four","five",
+      "had","his","her","him","did","say","said","s","t","re","ve","ll","d",
+    ]);
+
+    const termFreq = new Map<string, number>();
+
+    const extractTerms = (text: string, weight: number) => {
+      const words = text.toLowerCase()
+        .replace(/[^a-z0-9\s_\-]/g, " ")
+        .split(/\s+/)
+        .filter(w => w.length > 3 && !STOP_WORDS.has(w) && !/^\d+$/.test(w));
+      for (const w of words) termFreq.set(w, (termFreq.get(w) ?? 0) + weight);
+    };
+
+    if (currentTask) extractTerms(currentTask, 3);
+
+    for (const msg of recentConversations.slice(0, 6)) {
+      const snippet = msg.role === "user" ? msg.content.slice(0, 500) : msg.content.slice(0, 200);
+      extractTerms(snippet, msg.role === "user" ? 1.5 : 0.5);
+    }
+
+    if (recentTools) {
+      for (const t of recentTools.slice(-8)) {
+        const parts = t.toLowerCase().split(/[_\-\.]+/).filter(p => p.length > 3 && !STOP_WORDS.has(p));
+        for (const p of parts) termFreq.set(p, (termFreq.get(p) ?? 0) + 2);
+      }
+    }
+
+    return [...termFreq.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([term]) => term)
+      .join(" ");
+  }
+
+  // ── Auto-Reflection (Issue #14) ──────────────────────────────────────────────
+
+  private detectToolPatterns(tools: string[]): string[] {
+    if (tools.length < 6) return [];
+    const patternCounts = new Map<string, number>();
+    for (let len = 2; len <= 3; len++) {
+      for (let i = 0; i <= tools.length - len; i++) {
+        const seq = tools.slice(i, i + len).join(" → ");
+        patternCounts.set(seq, (patternCounts.get(seq) ?? 0) + 1);
+      }
+    }
+    return [...patternCounts.entries()]
+      .filter(([, count]) => count >= 3)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([seq, count]) => `"${seq}" repeated ${count}×`);
+  }
+
+  generateReflection(): string {
+    const db = this.projectDb;
+    if (!db) return "";
+    try {
+      const conversations = this.getRecentConversations(50);
+      const episodes      = this.listEpisodes(20);
+      const ctx           = this.getSessionContext();
+
+      const expRows = db.prepare(
+        "SELECT content, metadata FROM memories WHERE session_id = ? AND type = 'experience' ORDER BY updated_at DESC LIMIT 50"
+      ).all(this.sessionId) as { content: string; metadata: string }[];
+
+      const toolUsages: Array<{ tool: string; count: number; lastFile: string }> = [];
+      for (const row of expRows) {
+        try {
+          const meta = JSON.parse(row.metadata ?? "{}") as Record<string, unknown>;
+          if (meta.toolName && typeof meta.count === "number") {
+            toolUsages.push({
+              tool:     meta.toolName as string,
+              count:    meta.count,
+              lastFile: (meta.lastFile as string) ?? "",
+            });
+          }
+        } catch { /* skip malformed */ }
+      }
+      toolUsages.sort((a, b) => b.count - a.count);
+
+      const lines: string[] = [];
+      lines.push(`[AUTO-REFLECTION] Session: ${this.sessionId} | Generated: ${new Date().toISOString()}`);
+
+      if (episodes.length > 0) {
+        lines.push(`\nTASKS ATTEMPTED (${episodes.length} episode${episodes.length !== 1 ? "s" : ""}):`);
+        for (const ep of episodes) {
+          lines.push(`  [${ep.outcome.toUpperCase()}] ${ep.goal.slice(0, 120)}`);
+        }
+      }
+
+      const byOutcome: Record<string, number> = {};
+      for (const ep of episodes) byOutcome[ep.outcome] = (byOutcome[ep.outcome] ?? 0) + 1;
+      if (episodes.length > 0) {
+        const outcomeStr = Object.entries(byOutcome).map(([k, v]) => `${v} ${k}`).join(", ");
+        lines.push(`\nOUTCOMES: ${outcomeStr}`);
+      }
+
+      const allLessons: string[] = [];
+      for (const ep of episodes) allLessons.push(...ep.lessonsLearned);
+      if (allLessons.length > 0) {
+        lines.push(`\nLESSONS LEARNED (${allLessons.length}):`);
+        for (const lesson of allLessons.slice(0, 15)) {
+          lines.push(`  - ${lesson.slice(0, 150)}`);
+        }
+      }
+
+      if (toolUsages.length > 0) {
+        lines.push(`\nTOOL USAGE (top ${Math.min(10, toolUsages.length)}):`);
+        for (const t of toolUsages.slice(0, 10)) {
+          const fileInfo = t.lastFile ? ` (last: ${t.lastFile})` : "";
+          lines.push(`  - ${t.tool}: ${t.count}×${fileInfo}`);
+        }
+      }
+
+      const recentTools = ctx?.recentTools ?? [];
+      if (recentTools.length >= 6) {
+        const pats = this.detectToolPatterns(recentTools);
+        if (pats.length > 0) {
+          lines.push(`\nOBSERVED PATTERNS:`);
+          for (const p of pats) lines.push(`  - ${p}`);
+        }
+      }
+
+      const totalInvocations = toolUsages.reduce((s, t) => s + t.count, 0);
+      lines.push(`\nACTIVITY SUMMARY:`);
+      lines.push(`  - Conversation messages:   ${conversations.length}`);
+      lines.push(`  - Total tool invocations:  ${totalInvocations}`);
+      lines.push(`  - Unique tools used:       ${toolUsages.length}`);
+      lines.push(`  - Episodes tracked:        ${episodes.length}`);
+
+      const reflection = lines.join("\n");
+
+      const importance = Math.min(1.0, Math.max(0.4,
+        0.3 +
+        Math.min(0.3, episodes.length    * 0.05) +
+        Math.min(0.2, allLessons.length  * 0.04) +
+        Math.min(0.2, toolUsages.length  * 0.02)
+      ));
+
+      this.addMemory({
+        type: "fact",
+        content: reflection,
+        metadata: {
+          source:               "auto-reflection",
+          sessionId:            this.sessionId,
+          episodeCount:         episodes.length,
+          lessonCount:          allLessons.length,
+          toolCount:            toolUsages.length,
+          totalToolInvocations: totalInvocations,
+          generatedAt:          Date.now(),
+        },
+        importance,
+      }, "project");
+
+      return reflection;
+    } catch (e) {
+      console.error("[Memory] generateReflection error:", e);
+      return "";
+    }
+  }
+
+  getLatestReflection(): MemoryEntry | null {
+    const db = this.projectDb;
+    if (!db) return null;
+    try {
+      const rows = db.prepare(`
+        SELECT * FROM memories
+        WHERE session_id = ? AND type = 'fact' AND metadata LIKE '%"source":"auto-reflection"%'
+        ORDER BY created_at DESC LIMIT 1
+      `).all(this.sessionId) as MemoryRow[];
+      if (rows.length === 0) return null;
+      return { ...this.rowToEntry(rows[0]), layer: "project" };
+    } catch { return null; }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+
   close(): void {
     this.projectDb?.close();
     this.globalDb?.close();
@@ -1028,12 +1395,24 @@ class MemoryStore {
 
 const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
   const { directory } = input;
+  const config = (input as unknown as { config?: Record<string, unknown> }).config ?? {};
+  const reflectionEnabled = config.memory_reflection !== false;
+
   const projectDbPath = join(homedir(), ".local", "share", "opencode", "memory", "memory.db");
   const globalDbPath  = join(homedir(), ".config", "opencode", "memory", "global.db");
 
   const store = new MemoryStore(projectDbPath, globalDbPath);
   store.initialize();
-  console.log(`[Memory] v5 initialized | project: ${projectDbPath} | global: ${globalDbPath}`);
+  console.log(`[Memory] v6 initialized | project: ${projectDbPath} | global: ${globalDbPath}`);
+
+  setImmediate(() => {
+    try {
+      const archiveResult = store.archiveOldMemories();
+      const expResult     = store.cleanupExperiences();
+      const total = archiveResult.projectArchived + archiveResult.globalArchived + expResult.projectArchived;
+      if (total > 0) console.log(`[Memory] Auto-archived ${total} memories on startup (decay:${archiveResult.projectArchived + archiveResult.globalArchived} exp:${expResult.projectArchived})`);
+    } catch (e) { console.error("[Memory] Auto-archival error:", e); }
+  });
 
   const getSessionId = (h: { sessionID?: string }): string =>
     h?.sessionID || `project_${Buffer.from(directory).toString("base64").slice(0, 16)}`;
@@ -1044,8 +1423,22 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
   return {
     "experimental.chat.system.transform": async (h, output) => {
       store.setSessionId(getSessionId(h));
-      const memories = store.queryMemories({ limit: 10, minImportance: 0.4 });
-      const ctx      = store.getSessionContext();
+      const ctx         = store.getSessionContext();
+      const recentConvs = store.getRecentConversations(8);
+      const contextQuery = store.buildContextQuery(recentConvs, ctx?.currentTask, ctx?.recentTools);
+
+      let memories: MemoryEntry[];
+      if (contextQuery.trim()) {
+        memories = store.queryMemoriesHybrid(contextQuery, { limit: 10, minImportance: 0.3 });
+        if (memories.length < 3) {
+          const fallback = store.queryMemories({ limit: 10 - memories.length, minImportance: 0.4 });
+          const existing = new Set(memories.map(m => m.id));
+          memories.push(...fallback.filter(m => !existing.has(m.id)));
+        }
+      } else {
+        memories = store.queryMemories({ limit: 10, minImportance: 0.4 });
+      }
+
       if (memories.length === 0 && !ctx) return;
       const lines: string[] = [];
       if (memories.length > 0) {
@@ -1091,6 +1484,22 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
         const file = args?.filePath ?? args?.path;
         store.upsertToolUsage(toolName, file);
         store.addActionToEpisode(toolName, file ? `${toolName} on ${file}` : toolName);
+      }
+    },
+
+    event: async ({ event }) => {
+      if (event.type !== "session.idle") return;
+      if (!reflectionEnabled) return;
+      store.setSessionId(event.properties.sessionID);
+      const existing = store.getLatestReflection();
+      if (existing) {
+        const meta = existing.metadata as Record<string, unknown>;
+        const age = Date.now() - ((meta.generatedAt as number) ?? 0);
+        if (age < 3_600_000) return;
+      }
+      const reflection = store.generateReflection();
+      if (reflection) {
+        console.log(`[Memory] Auto-reflection stored for session ${event.properties.sessionID}`);
       }
     },
 
@@ -1316,6 +1725,95 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
           const s = store.getStats();
           const ctx = store.getSessionContext();
           return `🧠 Project: ${s.total} | Global: ${s.globalTotal} | 🎯 ${ctx?.currentTask ?? "No task"} | 🔧 ${ctx?.recentTools?.slice(-3).join(", ") ?? "None"}`;
+        },
+      }),
+
+      memory_query_context: tool({
+        description: "Retrieve memories relevant to current context (active task + recent tools + recent conversation). Use this to surface what the agent should know right now.",
+        args: {
+          limit: tool.schema.number().optional(),
+        },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const ctx = store.getSessionContext();
+          const recentConvs = store.getRecentConversations(8);
+          const contextQuery = store.buildContextQuery(recentConvs, ctx?.currentTask, ctx?.recentTools);
+          if (!contextQuery.trim()) {
+            return "No context signals. Set a task with memory_set_task or start a conversation first.";
+          }
+          const mems = store.queryMemoriesHybrid(contextQuery, { limit: args.limit ?? 10 });
+          if (mems.length === 0) {
+            return `Context query: "${contextQuery}"\nNo relevant memories found.`;
+          }
+          return `Context query: "${contextQuery}"\nFound ${mems.length} context-relevant memories:\n` +
+            mems.map(m => `- [${m.type}${m.layer === "global" ? "/global" : ""}] (id: ${m.id}) ${m.content} (score: ${m.decayScore?.toFixed(3)})`).join("\n");
+        },
+      }),
+
+      memory_archive: tool({
+        description: "Manually trigger archival: moves memories with decayScore < 0.05 + access < 2 + age > 30d to archived_memories, and archives experience-type memories older than 7 days. Returns counts.",
+        args: {},
+        async execute(_, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const archiveResult = store.archiveOldMemories();
+          const expResult     = store.cleanupExperiences();
+          const total = archiveResult.projectArchived + archiveResult.globalArchived + expResult.projectArchived;
+          return [
+            `Archival complete: ${total} memories archived`,
+            `- Low-score (project): ${archiveResult.projectArchived}`,
+            `- Low-score (global):  ${archiveResult.globalArchived}`,
+            `- Old experiences:     ${expResult.projectArchived}`,
+          ].join("\n");
+        },
+      }),
+
+      memory_list_archived: tool({
+        description: "List archived memories. Use memory_restore to move one back to active.",
+        args: {
+          limit: tool.schema.number().optional(),
+          layer: tool.schema.enum(["project","global"]).optional(),
+          type:  tool.schema.enum(["fact","experience","preference","skill"]).optional(),
+        },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const archived = store.listArchivedMemories({
+            limit: args.limit ?? 20,
+            layer: args.layer as MemoryLayer | undefined,
+            type:  args.type,
+          });
+          if (archived.length === 0) return "No archived memories found.";
+          return `${archived.length} archived memories:\n` +
+            archived.map(m => {
+              const preview     = m.content.slice(0, 80) + (m.content.length > 80 ? "…" : "");
+              const archivedDate = new Date(m.archivedAt).toISOString().split("T")[0];
+              return `[${m.type}/${m.layer}] ${m.id}  archived:${archivedDate}  reason:${m.archiveReason ?? "unknown"}  "${preview}"`;
+            }).join("\n");
+        },
+      }),
+
+      memory_restore: tool({
+        description: "Restore an archived memory back to active memories.",
+        args: { id: tool.schema.string() },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          return store.restoreMemory(args.id)
+            ? `Memory ${args.id} restored to active memories.`
+            : `Memory ${args.id} not found in archive.`;
+        },
+      }),
+
+      memory_get_reflection: tool({
+        description: "Retrieve the latest auto-generated session reflection — a rule-based summary of tasks attempted, outcomes, lessons learned, tool usage patterns, and activity stats. Auto-generated on session.idle when memory_reflection is enabled.",
+        args: {},
+        async execute(_, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const mem = store.getLatestReflection();
+          if (!mem) return "No auto-reflection found. Reflection is stored the first time the session becomes idle (or call memory_get_reflection after activity).";
+          const meta = mem.metadata as Record<string, unknown>;
+          const generatedAt = meta.generatedAt
+            ? new Date(meta.generatedAt as number).toISOString()
+            : "unknown";
+          return `Latest auto-reflection (generated: ${generatedAt}, importance: ${mem.importance.toFixed(2)}):\n\n${mem.content}`;
         },
       }),
     },

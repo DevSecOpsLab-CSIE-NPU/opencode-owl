@@ -1,21 +1,25 @@
 {
-  "name": "opencode-memory-system",
-  "version": "1.0.0",
-  "description": "Agent Memory System Plugin for OpenCode - Based on 'Memory in the Age of AI Agents' (arXiv:2512.13564v2)",
+  "name": "opencode-owl",
+  "version": "1.1.0",
+  "description": "Agent Memory System Plugin for OpenCode — FTS5 + sqlite-vec hybrid search, episode tracking, auto-reflection",
   "author": "AugustChaoTW",
   "license": "MIT",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "opencode-owl-mcp": "./dist/mcp-entry.js"
+  },
   "files": [
     "dist/",
-    "src/",
     "README.md",
     "install.sh"
   ],
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target node",
+    "build": "bun build src/index.ts src/mcp-server.ts src/mcp-entry.ts --outdir dist --target node",
     "dev": "bun build src/index.ts --outdir dist --target node --watch",
     "install:plugin": "./install.sh",
+    "mcp": "bun run dist/mcp-entry.js",
+    "prepublishOnly": "bun run build",
     "clean": "rm -rf dist node_modules"
   },
   "dependencies": {
@@ -33,13 +37,16 @@
     "memory",
     "agent",
     "ai",
-    "llm"
+    "llm",
+    "sqlite-vec",
+    "mcp"
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/AugustChaoTW/aug-money"
+    "url": "https://github.com/DevSecOpsLab-CSIE-NPU/opencode-owl"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18.0.0",
+    "bun": ">=1.0.0"
   }
 }
