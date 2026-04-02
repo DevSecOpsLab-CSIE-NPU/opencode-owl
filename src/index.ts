@@ -37,6 +37,9 @@ import * as sqliteVec from "sqlite-vec";
 import { join } from "path";
 import { mkdirSync, existsSync, copyFileSync } from "fs";
 import { homedir } from "os";
+import { exec } from "child_process";
+import { promisify } from "util";
+const execAsync = promisify(exec);
 
 type MemoryType   = "fact" | "experience" | "preference" | "skill";
 type MemoryLayer  = "global" | "project";
@@ -1962,7 +1965,56 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
             `Update available: v${info.currentVersion} → v${info.latestVersion} (${typeLabel})`,
             changelog ? `\nChangelog:\n${changelog}` : "",
             `Release: ${info.releaseUrl}`,
+            `Run memory_update to install.`,
           ].filter(Boolean).join("\n");
+        },
+      }),
+
+      memory_update_plugin: tool({
+        description: "Download and install the latest plugin version. Backs up current files before updating. Requires git and bun. Prompts user to restart OpenCode after completion.",
+        args: {},
+        async execute(_, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const info = await versionChecker.check();
+          if (!info.updateAvailable) return `Already up to date (v${info.currentVersion}). Nothing to update.`;
+
+          const pluginDir = join(homedir(), ".config", "opencode", "plugins", "memory-system");
+          const backupDir = join(homedir(), ".local", "share", "opencode", "memory", "backup");
+          const tmpDir = `/tmp/opencode-owl-update-${Date.now()}`;
+
+          try {
+            const backupTs = new Date().toISOString().replace(/[:.]/g, "-");
+            const backupPath = `${backupDir}/${backupTs}`;
+            if (existsSync(pluginDir)) {
+              mkdirSync(backupPath, { recursive: true });
+              copyFileSync(join(pluginDir, "index.js"), join(backupPath, "index.js"));
+              copyFileSync(join(pluginDir, "package.json"), join(backupPath, "package.json"));
+            }
+
+            await execAsync(`git clone --depth 1 --branch v${info.latestVersion} https://github.com/DevSecOpsLab-CSIE-NPU/opencode-owl.git ${tmpDir}`);
+            await execAsync(`cd ${tmpDir} && bun install && bun run build`);
+
+            mkdirSync(pluginDir, { recursive: true });
+            await execAsync(`cp -r ${tmpDir}/dist/* ${pluginDir}/`);
+            await execAsync(`cp ${tmpDir}/package.json ${pluginDir}/`);
+            await execAsync(`rm -rf ${tmpDir}`);
+
+            return [
+              `Updated to v${info.latestVersion}!`,
+              `Backup saved to: ${backupPath}`,
+              ``,
+              `Restart OpenCode to activate the new version.`,
+            ].join("\n");
+          } catch (e: unknown) {
+            const errMsg = e instanceof Error ? e.message : String(e);
+            await execAsync(`rm -rf ${tmpDir}`).catch(() => {});
+            return [
+              `Update failed: ${errMsg}`,
+              `Your current version (v${info.currentVersion}) is unchanged.`,
+              `Backup available at: ${backupDir}/`,
+              `Try manual update: curl -fsSL https://raw.githubusercontent.com/DevSecOpsLab-CSIE-NPU/opencode-owl/main/update.sh | bash`,
+            ].join("\n");
+          }
         },
       }),
     },

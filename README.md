@@ -91,6 +91,7 @@ Restart OpenCode. The plugin initializes both databases on first run.
 | `memory_status` | One-line memory system summary |
 | `memory_version` | Show current package version, schema version, and update status |
 | `memory_check_update` | Manually check for available updates from GitHub releases |
+| `memory_update_plugin` | Download, build, and install the latest version automatically |
 
 ### Archive Management
 
@@ -306,6 +307,11 @@ Migrations run automatically on startup. Pre-migration backup (`.db.bak`) is cre
 1. Ensure Ollama is running: `curl http://localhost:11434/api/tags`
 2. Verify model is available: `ollama pull nomic-embed-text`
 3. Check `memory_status()` — if `vectorAvailable` is false, system defaults to FTS5-only search.
+
+**Updating the plugin**
+- Automatic: Call `memory_check_update` then `memory_update_plugin` from within OpenCode
+- Manual: `curl -fsSL https://raw.githubusercontent.com/DevSecOpsLab-CSIE-NPU/opencode-owl/main/update.sh | bash`
+- Both methods back up current files before updating
 
 ## MCP Server Mode
 
