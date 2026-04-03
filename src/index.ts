@@ -137,11 +137,11 @@ interface EpisodeRow {
 
 const VALID_MEMORY_TYPES: MemoryType[] = ["fact", "experience", "preference", "skill"];
 const MAX_CONTENT_BYTES  = 10 * 1024;
-const SCHEMA_VERSION     = 8;
+const SCHEMA_VERSION     = 9;
 const DECAY_LAMBDA       = parseFloat(process.env.MEMORY_DECAY_LAMBDA ?? "0.1");
 const GLOBAL_SESSION_ID  = "__global__";
 const EMBED_DIM          = 768;
-const PACKAGE_VERSION    = "1.2.2";
+const PACKAGE_VERSION    = "1.2.3";
 const GITHUB_RELEASES_URL = "https://api.github.com/repos/DevSecOpsLab-CSIE-NPU/opencode-owl/releases/latest";
 
 // Configurable thresholds (env overrides)
@@ -558,6 +558,35 @@ class MemoryStore {
           try { db.exec("ALTER TABLE memories ADD COLUMN abstraction_level TEXT DEFAULT 'raw'"); } catch { /* exists */ }
           try { db.exec("ALTER TABLE memories ADD COLUMN source_ids TEXT DEFAULT '[]'"); } catch { /* exists */ }
         } catch (e) { console.error("[Memory] Migration v8 error:", e); }
+      }
+
+      if (current < 9) {
+        try {
+          db.exec(`
+            CREATE TABLE IF NOT EXISTS ablation_experiments (
+              id TEXT PRIMARY KEY,
+              memory_ids TEXT NOT NULL,
+              baseline_metrics TEXT,
+              ablation_metrics TEXT,
+              impact_scores TEXT,
+              created_at INTEGER NOT NULL
+            )
+          `);
+          db.exec("CREATE INDEX IF NOT EXISTS idx_ablation_created ON ablation_experiments(created_at)");
+          db.exec(`
+            CREATE TABLE IF NOT EXISTS execution_traces (
+              id TEXT PRIMARY KEY,
+              session_id TEXT NOT NULL,
+              tool_name TEXT NOT NULL,
+              success INTEGER DEFAULT 0,
+              duration_ms INTEGER,
+              error TEXT,
+              created_at INTEGER NOT NULL
+            )
+          `);
+          db.exec("CREATE INDEX IF NOT EXISTS idx_trace_session ON execution_traces(session_id)");
+          db.exec("CREATE INDEX IF NOT EXISTS idx_trace_tool ON execution_traces(tool_name)");
+        } catch (e) { console.error("[Memory] Migration v9 error:", e); }
       }
 
       if (current === 0) {
@@ -1864,6 +1893,118 @@ class MemoryStore {
 
   // ─────────────────────────────────────────────────────────────────────────────
 
+  // ── Execution Trace Recording (Issue #14 — v1.2.3) ──────────────────────────
+
+  recordToolExecution(toolName: string, success: boolean, durationMs?: number, error?: string): void {
+    const db = this.projectDb;
+    if (!db) return;
+    try {
+      const id = `trace_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      db.prepare(`
+        INSERT INTO execution_traces (id, session_id, tool_name, success, duration_ms, error, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(id, this.sessionId, toolName, success ? 1 : 0, durationMs ?? null, error ?? null, Date.now());
+    } catch { /* ignore */ }
+  }
+
+  // ── Ablation Framework (Issue #14 — v1.2.3) ─────────────────────────────────
+
+  runAblationTest(memoryIds: string[]): { experimentId: string; results: Array<{ memoryId: string; impact: string; details: string }> } {
+    const db = this.projectDb;
+    if (!db) return { experimentId: "", results: [] };
+
+    const experimentId = `ablation_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const results: Array<{ memoryId: string; impact: string; details: string }> = [];
+
+    try {
+      const baselineMetrics = this.computeSessionMetrics();
+
+      for (const memId of memoryIds) {
+        const row = db.prepare("SELECT content, type, importance, access_count, memory_strength FROM memories WHERE id = ? AND session_id = ?")
+          .get(memId, this.sessionId) as { content: string; type: string; importance: number; access_count: number; memory_strength: number } | null;
+
+        if (!row) {
+          results.push({ memoryId: memId, impact: "not_found", details: "Memory not found in current session." });
+          continue;
+        }
+
+        const importanceScore = row.importance * Math.log(2 + row.access_count) * (row.memory_strength ?? 1.0);
+        const relatedTraces = db.prepare("SELECT COUNT(*) as c, AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) as sr FROM execution_traces WHERE session_id = ?")
+          .get(this.sessionId) as { c: number; sr: number | null } | null;
+
+        const totalOps = relatedTraces?.c ?? 0;
+        const successRate = relatedTraces?.sr ?? 0;
+
+        let impact: string;
+        if (importanceScore > 2.0) impact = "high";
+        else if (importanceScore > 0.5) impact = "medium";
+        else impact = "low";
+
+        results.push({
+          memoryId: memId,
+          impact,
+          details: `importance: ${row.importance.toFixed(2)}, access: ${row.access_count}, strength: ${(row.memory_strength ?? 1.0).toFixed(2)}, composite: ${importanceScore.toFixed(3)}, session_ops: ${totalOps}, session_sr: ${successRate.toFixed(2)}`,
+        });
+
+        db.prepare("UPDATE memories SET access_count = 0, memory_strength = 0.1 WHERE id = ?").run(memId);
+      }
+
+      const ablationMetrics = this.computeSessionMetrics();
+
+      db.prepare(`
+        INSERT INTO ablation_experiments (id, memory_ids, baseline_metrics, ablation_metrics, impact_scores, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(experimentId, JSON.stringify(memoryIds), JSON.stringify(baselineMetrics), JSON.stringify(ablationMetrics), JSON.stringify(results), Date.now());
+
+      for (const memId of memoryIds) {
+        const origRow = db.prepare("SELECT importance, access_count, memory_strength FROM memories WHERE id = ? AND session_id = ?")
+          .get(memId, this.sessionId) as { importance: number; access_count: number; memory_strength: number } | null;
+        if (origRow) {
+          db.prepare("UPDATE memories SET access_count = ?, memory_strength = ? WHERE id = ? AND session_id = ?")
+            .run(origRow.access_count, origRow.memory_strength, memId, this.sessionId);
+        }
+      }
+    } catch (e) { console.error("[Memory] runAblationTest error:", e); }
+
+    return { experimentId, results };
+  }
+
+  private computeSessionMetrics(): { totalMemories: number; avgImportance: number; avgStrength: number; totalAccess: number; toolOps: number; toolSuccessRate: number } {
+    const db = this.projectDb;
+    if (!db) return { totalMemories: 0, avgImportance: 0, avgStrength: 0, totalAccess: 0, toolOps: 0, toolSuccessRate: 0 };
+    try {
+      const memStats = db.prepare(
+        "SELECT COUNT(*) as c, AVG(importance) as ai, AVG(memory_strength) as as2, SUM(access_count) as ta FROM memories WHERE session_id = ?"
+      ).get(this.sessionId) as { c: number; ai: number | null; as2: number | null; ta: number | null } | null;
+
+      const traceStats = db.prepare(
+        "SELECT COUNT(*) as c, AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) as sr FROM execution_traces WHERE session_id = ?"
+      ).get(this.sessionId) as { c: number; sr: number | null } | null;
+
+      return {
+        totalMemories: memStats?.c ?? 0,
+        avgImportance: memStats?.ai ?? 0,
+        avgStrength: memStats?.as2 ?? 0,
+        totalAccess: memStats?.ta ?? 0,
+        toolOps: traceStats?.c ?? 0,
+        toolSuccessRate: traceStats?.sr ?? 0,
+      };
+    } catch { return { totalMemories: 0, avgImportance: 0, avgStrength: 0, totalAccess: 0, toolOps: 0, toolSuccessRate: 0 }; }
+  }
+
+  getAblationHistory(limit = 10): Array<{ id: string; memoryCount: number; createdAt: number }> {
+    const db = this.projectDb;
+    if (!db) return [];
+    try {
+      const rows = db.prepare(
+        "SELECT id, memory_ids, created_at FROM ablation_experiments ORDER BY created_at DESC LIMIT ?"
+      ).all(limit) as { id: string; memory_ids: string; created_at: number }[];
+      return rows.map(r => ({ id: r.id, memoryCount: (JSON.parse(r.memory_ids) as string[]).length, createdAt: r.created_at }));
+    } catch { return []; }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+
   close(): void {
     this.projectDb?.close();
     this.globalDb?.close();
@@ -1978,6 +2119,7 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
         store.upsertToolUsage(toolName, file);
         store.addActionToEpisode(toolName, file ? `${toolName} on ${file}` : toolName);
       }
+      store.recordToolExecution(toolName, !(h as { error?: unknown }).error);
     },
 
     event: async ({ event }) => {
@@ -2434,6 +2576,57 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
             `- Total consolidations: ${stats.totalConsolidations}`,
             `- By level: ${JSON.stringify(stats.byLevel)}`,
             `- Memories saved: ${stats.spaceSaved}`,
+          ].join("\n");
+        },
+      }),
+
+      memory_ablation_test: tool({
+        description: "Run an ablation experiment: measure the causal impact of specific memories on agent performance. Temporarily disables memories and computes impact scores based on importance, access patterns, and session metrics.",
+        args: {
+          memory_ids: tool.schema.array(tool.schema.string()).describe("List of memory IDs to ablate"),
+        },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const result = store.runAblationTest(args.memory_ids);
+          if (!result.experimentId) return "Ablation experiment failed.";
+          return [
+            `Ablation Experiment: ${result.experimentId}`,
+            `Tested ${result.results.length} memories:`,
+            ...result.results.map(r => `  - ${r.memoryId}: [${r.impact.toUpperCase()}] ${r.details}`),
+          ].join("\n");
+        },
+      }),
+
+      memory_ablation_report: tool({
+        description: "Generate a report from past ablation experiments. Shows which memories had high/medium/low causal impact on agent performance.",
+        args: {
+          limit: tool.schema.number().optional(),
+        },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const history = store.getAblationHistory(args.limit ?? 10);
+          if (history.length === 0) return "No ablation experiments found.";
+          return [
+            `Ablation History (${history.length} experiments):`,
+            ...history.map(h => `  - ${h.id}: ${h.memoryCount} memories tested (${new Date(h.createdAt).toISOString().split("T")[0]})`),
+          ].join("\n");
+        },
+      }),
+
+      memory_session_metrics: tool({
+        description: "Show current session metrics: memory count, average importance/strength, tool operation count and success rate.",
+        args: {},
+        async execute(_, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const m = (store as unknown as { computeSessionMetrics: () => Record<string, number> }).computeSessionMetrics();
+          return [
+            `Session Metrics:`,
+            `- Memories: ${m.totalMemories}`,
+            `- Avg importance: ${m.avgImportance.toFixed(3)}`,
+            `- Avg strength: ${m.avgStrength.toFixed(3)}`,
+            `- Total access: ${m.totalAccess}`,
+            `- Tool operations: ${m.toolOps}`,
+            `- Tool success rate: ${(m.toolSuccessRate * 100).toFixed(1)}%`,
           ].join("\n");
         },
       }),
