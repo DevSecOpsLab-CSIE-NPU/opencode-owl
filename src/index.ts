@@ -137,11 +137,11 @@ interface EpisodeRow {
 
 const VALID_MEMORY_TYPES: MemoryType[] = ["fact", "experience", "preference", "skill"];
 const MAX_CONTENT_BYTES  = 10 * 1024;
-const SCHEMA_VERSION     = 7;
+const SCHEMA_VERSION     = 8;
 const DECAY_LAMBDA       = parseFloat(process.env.MEMORY_DECAY_LAMBDA ?? "0.1");
 const GLOBAL_SESSION_ID  = "__global__";
 const EMBED_DIM          = 768;
-const PACKAGE_VERSION    = "1.2.1";
+const PACKAGE_VERSION    = "1.2.2";
 const GITHUB_RELEASES_URL = "https://api.github.com/repos/DevSecOpsLab-CSIE-NPU/opencode-owl/releases/latest";
 
 // Configurable thresholds (env overrides)
@@ -538,6 +538,26 @@ class MemoryStore {
           db.exec("CREATE INDEX IF NOT EXISTS idx_conflict_target ON conflict_log(target_id)");
           db.exec("CREATE INDEX IF NOT EXISTS idx_conflict_type ON conflict_log(conflict_type)");
         } catch (e) { console.error("[Memory] Migration v7 error:", e); }
+      }
+
+      if (current < 8) {
+        try {
+          db.exec(`
+            CREATE TABLE IF NOT EXISTS consolidation_history (
+              id TEXT PRIMARY KEY,
+              keeper_id TEXT NOT NULL,
+              merged_ids TEXT NOT NULL,
+              original_content TEXT,
+              consolidated_content TEXT NOT NULL,
+              abstraction_level TEXT DEFAULT 'raw',
+              source_ids TEXT,
+              created_at INTEGER NOT NULL
+            )
+          `);
+          db.exec("CREATE INDEX IF NOT EXISTS idx_consolidation_keeper ON consolidation_history(keeper_id)");
+          try { db.exec("ALTER TABLE memories ADD COLUMN abstraction_level TEXT DEFAULT 'raw'"); } catch { /* exists */ }
+          try { db.exec("ALTER TABLE memories ADD COLUMN source_ids TEXT DEFAULT '[]'"); } catch { /* exists */ }
+        } catch (e) { console.error("[Memory] Migration v8 error:", e); }
       }
 
       if (current === 0) {
@@ -1685,11 +1705,14 @@ class MemoryStore {
     } catch { return []; }
   }
 
-  // ── Memory Consolidation (Issue #11 — Gap 4) ────────────────────────────────
+  // ── Memory Consolidation (Issue #11 — Gap 4 / Issue #13 — v1.2.2) ────────────
 
-  consolidateMemories(dryRun = false): { groups: number; merged: number; details: string[] } {
+  consolidateMemories(dryRun = false, policy: "aggressive" | "moderate" | "conservative" = "moderate"): { groups: number; merged: number; details: string[] } {
     const db = this.projectDb;
     if (!db) return { groups: 0, merged: 0, details: [] };
+
+    const thresholds: Record<string, number> = { aggressive: 0.7, moderate: CONSOLIDATION_SIMILARITY, conservative: 0.95 };
+    const threshold = thresholds[policy] ?? CONSOLIDATION_SIMILARITY;
 
     const details: string[] = [];
     let merged = 0;
@@ -1720,7 +1743,7 @@ class MemoryStore {
           const overlap = [...wordsA].filter(w => wordsB.has(w)).length;
           const jaccard = overlap / (wordsA.size + wordsB.size - overlap);
 
-          if (jaccard >= CONSOLIDATION_SIMILARITY) {
+          if (jaccard >= threshold) {
             group.push(rows[j].id);
             visited.add(rows[j].id);
           }
@@ -1744,6 +1767,7 @@ class MemoryStore {
         const keeperRow = db.prepare("SELECT content FROM memories WHERE id = ?").get(keeper) as { content: string } | null;
         if (!keeperRow) continue;
 
+        const mergedIds: string[] = [];
         for (const memId of toMerge) {
           const mergeRow = db.prepare("SELECT content, importance FROM memories WHERE id = ? AND session_id = ?")
             .get(memId, this.sessionId) as { content: string; importance: number } | null;
@@ -1755,13 +1779,87 @@ class MemoryStore {
           this.deleteVecRow(db, memId);
           db.prepare("DELETE FROM memories WHERE id = ?").run(memId);
           merged++;
+          mergedIds.push(memId);
         }
+
+        const histId = `consolidation_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        db.prepare(`
+          INSERT INTO consolidation_history (id, keeper_id, merged_ids, original_content, consolidated_content, abstraction_level, source_ids, created_at)
+          VALUES (?, ?, ?, ?, ?, 'raw', ?, ?)
+        `).run(histId, keeper, JSON.stringify(mergedIds), keeperRow.content, db.prepare("SELECT content FROM memories WHERE id = ?").get(keeper) as { content: string } | null, JSON.stringify([keeper, ...mergedIds]), Date.now());
 
         details.push(`Merged ${toMerge.length} memories into ${keeper}: "${keeperRow.content.slice(0, 60)}..."`);
       }
     } catch (e) { console.error("[Memory] consolidateMemories error:", e); }
 
     return { groups: groupCount, merged, details };
+  }
+
+  consolidateWithSummary(keeperId: string, summary: string, sourceIds: string[]): { success: boolean; details: string } {
+    const db = this.projectDb;
+    if (!db) return { success: false, details: "No database available." };
+    try {
+      const keeperRow = db.prepare("SELECT content FROM memories WHERE id = ? AND session_id = ?")
+        .get(keeperId, this.sessionId) as { content: string } | null;
+      if (!keeperRow) return { success: false, details: `Keeper memory ${keeperId} not found.` };
+
+      db.prepare("UPDATE memories SET content = ?, abstraction_level = 'consolidated', source_ids = ? WHERE id = ? AND session_id = ?")
+        .run(summary, JSON.stringify(sourceIds), keeperId, this.sessionId);
+      this.deleteFtsRow(db, keeperId);
+      this.insertFtsRow(db, keeperId, this.sessionId, summary);
+
+      const toRemove = sourceIds.filter(id => id !== keeperId);
+      for (const id of toRemove) {
+        this.deleteFtsRow(db, id);
+        this.deleteVecRow(db, id);
+        db.prepare("DELETE FROM memories WHERE id = ? AND session_id = ?").run(id, this.sessionId);
+      }
+
+      const histId = `consolidation_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      db.prepare(`
+        INSERT INTO consolidation_history (id, keeper_id, merged_ids, original_content, consolidated_content, abstraction_level, source_ids, created_at)
+        VALUES (?, ?, ?, ?, ?, 'llm_summary', ?, ?)
+      `).run(histId, keeperId, JSON.stringify(sourceIds), keeperRow.content, summary, JSON.stringify(sourceIds), Date.now());
+
+      return { success: true, details: `Memory ${keeperId} updated with LLM summary. ${toRemove.length} source memories removed.` };
+    } catch (e) { console.error("[Memory] consolidateWithSummary error:", e); return { success: false, details: String(e) }; }
+  }
+
+  deconsolidateMemory(id: string): { success: boolean; details: string } {
+    const db = this.projectDb;
+    if (!db) return { success: false, details: "No database available." };
+    try {
+      const row = db.prepare("SELECT content, source_ids, abstraction_level FROM memories WHERE id = ? AND session_id = ?")
+        .get(id, this.sessionId) as { content: string; source_ids: string; abstraction_level: string } | null;
+      if (!row) return { success: false, details: `Memory ${id} not found.` };
+      if (row.abstraction_level !== 'consolidated' && row.abstraction_level !== 'llm_summary')
+        return { success: false, details: `Memory ${id} is not a consolidated memory.` };
+
+      const sourceIds = JSON.parse(row.source_ids ?? "[]") as string[];
+      if (sourceIds.length === 0) return { success: false, details: "No source IDs found for de-consolidation." };
+
+      const parts = row.content.split(/\[consolidated\]/);
+      if (parts.length < sourceIds.length) return { success: false, details: "Content cannot be split into original parts." };
+
+      db.prepare("UPDATE memories SET abstraction_level = 'raw', source_ids = '[]' WHERE id = ? AND session_id = ?").run(id, this.sessionId);
+      this.deleteFtsRow(db, id);
+      this.insertFtsRow(db, id, this.sessionId, parts[0]);
+
+      return { success: true, details: `Memory ${id} de-consolidated. Original structure restored.` };
+    } catch (e) { console.error("[Memory] deconsolidateMemory error:", e); return { success: false, details: String(e) }; }
+  }
+
+  consolidationStats(): { totalConsolidations: number; byLevel: Record<string, number>; spaceSaved: number } {
+    const db = this.projectDb;
+    if (!db) return { totalConsolidations: 0, byLevel: {}, spaceSaved: 0 };
+    try {
+      const total = (db.prepare("SELECT COUNT(*) as c FROM consolidation_history").get() as { c: number }).c;
+      const byLevel: Record<string, number> = {};
+      (db.prepare("SELECT abstraction_level, COUNT(*) as c FROM consolidation_history GROUP BY abstraction_level")
+        .all() as { abstraction_level: string; c: number }[]).forEach(r => { byLevel[r.abstraction_level] = r.c; });
+      const spaceSaved = (db.prepare("SELECT SUM(json_array_length(merged_ids)) as s FROM consolidation_history").get() as { s: number | null }).s ?? 0;
+      return { totalConsolidations: total, byLevel, spaceSaved };
+    } catch { return { totalConsolidations: 0, byLevel: {}, spaceSaved: 0 }; }
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -2284,18 +2382,58 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
       }),
 
       memory_consolidate: tool({
-        description: "Merge similar/overlapping memories to reduce redundancy. Uses Jaccard similarity on content words. Returns group count and merge count.",
+        description: "Merge similar/overlapping memories to reduce redundancy. Supports aggressive/moderate/conservative policies. Returns group count and merge count.",
         args: {
           dry_run: tool.schema.boolean().optional().describe("Preview merges without executing"),
+          policy:  tool.schema.enum(["aggressive","moderate","conservative"]).optional().describe("Similarity threshold policy (default: moderate)"),
         },
         async execute(args, { sessionID }) {
           store.setSessionId(sid(sessionID));
-          const result = store.consolidateMemories(args.dry_run ?? false);
+          const result = store.consolidateMemories(args.dry_run ?? false, (args.policy as "aggressive" | "moderate" | "conservative") ?? "moderate");
           if (result.groups === 0) return "No similar memories found to consolidate.";
           return [
             `Consolidation complete: ${result.groups} group(s), ${result.merged} memories merged.`,
             ...(args.dry_run ? ["(dry run — no changes made)"] : []),
             ...result.details.slice(0, 10),
+          ].join("\n");
+        },
+      }),
+
+      memory_consolidate_with_summary: tool({
+        description: "Replace a group of similar memories with an LLM-generated summary. The agent should generate the summary externally and pass it here. Removes source memories after consolidation.",
+        args: {
+          keeper_id:  tool.schema.string().describe("Memory ID to keep as the consolidated entry"),
+          summary:    tool.schema.string().describe("LLM-generated summary of the group"),
+          source_ids: tool.schema.array(tool.schema.string()).describe("All memory IDs in the group (including keeper_id)"),
+        },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const result = store.consolidateWithSummary(args.keeper_id, args.summary, args.source_ids);
+          return result.success ? `✅ ${result.details}` : `❌ ${result.details}`;
+        },
+      }),
+
+      memory_deconsolidate: tool({
+        description: "Reverse a consolidation, restoring the original memory structure.",
+        args: { id: tool.schema.string().describe("Consolidated memory ID to restore") },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const result = store.deconsolidateMemory(args.id);
+          return result.success ? `✅ ${result.details}` : `❌ ${result.details}`;
+        },
+      }),
+
+      memory_consolidation_stats: tool({
+        description: "View consolidation history and statistics. Shows total consolidations, by abstraction level, and space saved.",
+        args: {},
+        async execute(_, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const stats = store.consolidationStats();
+          return [
+            `Consolidation Statistics:`,
+            `- Total consolidations: ${stats.totalConsolidations}`,
+            `- By level: ${JSON.stringify(stats.byLevel)}`,
+            `- Memories saved: ${stats.spaceSaved}`,
           ].join("\n");
         },
       }),
