@@ -137,11 +137,11 @@ interface EpisodeRow {
 
 const VALID_MEMORY_TYPES: MemoryType[] = ["fact", "experience", "preference", "skill"];
 const MAX_CONTENT_BYTES  = 10 * 1024;
-const SCHEMA_VERSION     = 6;
+const SCHEMA_VERSION     = 7;
 const DECAY_LAMBDA       = parseFloat(process.env.MEMORY_DECAY_LAMBDA ?? "0.1");
 const GLOBAL_SESSION_ID  = "__global__";
 const EMBED_DIM          = 768;
-const PACKAGE_VERSION    = "1.2.0";
+const PACKAGE_VERSION    = "1.2.1";
 const GITHUB_RELEASES_URL = "https://api.github.com/repos/DevSecOpsLab-CSIE-NPU/opencode-owl/releases/latest";
 
 // Configurable thresholds (env overrides)
@@ -156,6 +156,8 @@ const CONTEXT_TERM_LIMIT          = parseInt(process.env.MEMORY_CONTEXT_TERM_LIM
 const CONVERSATION_HISTORY_LIMIT  = parseInt(process.env.MEMORY_CONVERSATION_LIMIT ?? "50", 10);
 const REFLECTION_THROTTLE_MS      = parseInt(process.env.MEMORY_REFLECTION_THROTTLE ?? "3600000", 10);
 const TOOL_PATTERN_MIN_REPEAT     = parseInt(process.env.MEMORY_TOOL_PATTERN_MIN ?? "3", 10);
+const SEMANTIC_CONFLICT_THRESHOLD = parseFloat(process.env.MEMORY_SEMANTIC_CONFLICT_THRESHOLD ?? "0.75");
+const CONFLICT_RESOLUTION_STRATEGY = process.env.MEMORY_CONFLICT_RESOLUTION ?? "confidence";
 
 const SENSITIVE_PATTERNS: readonly RegExp[] = [
   /sk-[a-zA-Z0-9]{20,}/g,
@@ -516,6 +518,26 @@ class MemoryStore {
           db.exec("CREATE INDEX IF NOT EXISTS idx_archived_type ON archived_memories(type)");
           db.exec("CREATE INDEX IF NOT EXISTS idx_archived_at ON archived_memories(archived_at)");
         } catch (e) { console.error("[Memory] Migration v6 error:", e); }
+      }
+
+      if (current < 7) {
+        try {
+          db.exec(`
+            CREATE TABLE IF NOT EXISTS conflict_log (
+              id TEXT PRIMARY KEY,
+              source_id TEXT NOT NULL,
+              target_id TEXT NOT NULL,
+              conflict_type TEXT NOT NULL,
+              similarity_score REAL,
+              resolution TEXT,
+              resolved_at INTEGER,
+              created_at INTEGER NOT NULL
+            )
+          `);
+          db.exec("CREATE INDEX IF NOT EXISTS idx_conflict_source ON conflict_log(source_id)");
+          db.exec("CREATE INDEX IF NOT EXISTS idx_conflict_target ON conflict_log(target_id)");
+          db.exec("CREATE INDEX IF NOT EXISTS idx_conflict_type ON conflict_log(conflict_type)");
+        } catch (e) { console.error("[Memory] Migration v7 error:", e); }
       }
 
       if (current === 0) {
@@ -1503,18 +1525,29 @@ class MemoryStore {
     } catch { return null; }
   }
 
-  // ── Conflict Detection (Issue #11 — Gap 3) ──────────────────────────────────
+  // ── Conflict Detection (Issue #12 — v1.2.1) ──────────────────────────────────
 
-  detectConflicts(newContent: string, newType: MemoryType, layer: MemoryLayer): Array<{ id: string; content: string; reason: string }> {
+  private cosineSimilarity(a: Float32Array, b: Float32Array): number {
+    let dot = 0, normA = 0, normB = 0;
+    for (let i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+    if (normA === 0 || normB === 0) return 0;
+    return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+  }
+
+  detectConflicts(newContent: string, newType: MemoryType, layer: MemoryLayer): Array<{ id: string; content: string; reason: string; score: number }> {
     const db = layer === "global" ? this.globalDb : this.projectDb;
     if (!db) return [];
     const sessId = layer === "global" ? GLOBAL_SESSION_ID : this.sessionId;
-    const conflicts: Array<{ id: string; content: string; reason: string }> = [];
+    const conflicts: Array<{ id: string; content: string; reason: string; score: number }> = [];
 
     try {
       const rows = db.prepare(
-        "SELECT id, content, metadata, type FROM memories WHERE session_id = ? AND type = ?"
-      ).all(sessId, newType) as { id: string; content: string; metadata: string; type: string }[];
+        "SELECT id, content, metadata, type, embedding FROM memories WHERE session_id = ? AND type = ?"
+      ).all(sessId, newType) as { id: string; content: string; metadata: string; type: string; embedding: Buffer | null }[];
 
       const newLower = newContent.toLowerCase();
       const newWords = new Set(newLower.split(/\s+/).filter(w => w.length > 3));
@@ -1533,33 +1566,123 @@ class MemoryStore {
             id: row.id,
             content: row.content.slice(0, 120),
             reason: `high_similarity(jaccard=${jaccard.toFixed(2)})`,
+            score: jaccard,
           });
+        }
+
+        if (row.embedding && this.vecAvailable) {
+          try {
+            const existingVec = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4);
+            const negationPatterns = [
+              /\b(not|never|don't|doesn't|isn't|aren't|wasn't|weren't|no |without|disabled)\b/gi,
+              /\b(use|uses|using|prefer|avoid|disable|enable|skip)\b/gi,
+            ];
+            const newHasNegation = negationPatterns.some(p => p.test(newContent));
+            const existingHasNegation = negationPatterns.some(p => p.test(row.content));
+
+            if (newHasNegation !== existingHasNegation) {
+              const similarity = 1.0 - this.cosineSimilarity(existingVec, existingVec);
+              if (similarity > SEMANTIC_CONFLICT_THRESHOLD) {
+                conflicts.push({
+                  id: row.id,
+                  content: row.content.slice(0, 120),
+                  reason: `semantic_contradiction(cosine=${similarity.toFixed(2)})`,
+                  score: similarity,
+                });
+              }
+            }
+          } catch { /* skip malformed embedding */ }
         }
       }
 
-      const negationPatterns = [
+      const negationPatterns2 = [
         /\b(not|never|don't|doesn't|isn't|aren't|wasn't|weren't|no |without|disabled|disabled)\b/gi,
         /\b(use|uses|using|prefer|avoid|disable|enable|skip|skip)\b/gi,
       ];
-      const newHasNegation = negationPatterns.some(p => p.test(newContent));
+      const newHasNegation2 = negationPatterns2.some(p => p.test(newContent));
 
       for (const row of rows) {
         const existingWords2 = new Set(row.content.toLowerCase().split(/\s+/).filter(w => w.length > 3));
-        const existingHasNegation = negationPatterns.some(p => p.test(row.content));
-        if (newHasNegation !== existingHasNegation) {
+        const existingHasNegation = negationPatterns2.some(p => p.test(row.content));
+        if (newHasNegation2 !== existingHasNegation) {
           const sharedTerms = [...newWords].filter(w => existingWords2.has(w));
           if (sharedTerms.length >= 3) {
             conflicts.push({
               id: row.id,
               content: row.content.slice(0, 120),
               reason: `possible_contradiction(shared_terms=${sharedTerms.join(",")})`,
+              score: sharedTerms.length / Math.max(newWords.size, existingWords2.size),
             });
           }
         }
       }
     } catch { /* ignore */ }
 
-    return conflicts;
+    return conflicts.sort((a, b) => b.score - a.score);
+  }
+
+  resolveConflict(sourceId: string, targetId: string, strategy: "time" | "confidence" | "access" | "manual" = "confidence"): { success: boolean; winner: string; loser: string; details: string } {
+    const db = this.projectDb;
+    if (!db) return { success: false, winner: "", loser: "", details: "No database available." };
+
+    try {
+      const sourceRow = db.prepare("SELECT * FROM memories WHERE id = ? AND session_id = ?")
+        .get(sourceId, this.sessionId) as MemoryRow | null;
+      const targetRow = db.prepare("SELECT * FROM memories WHERE id = ? AND session_id = ?")
+        .get(targetId, this.sessionId) as MemoryRow | null;
+
+      if (!sourceRow || !targetRow) return { success: false, winner: "", loser: "", details: "One or both memories not found." };
+
+      let winner: MemoryRow, loser: MemoryRow;
+
+      switch (strategy) {
+        case "time":
+          winner = sourceRow.updated_at >= targetRow.updated_at ? sourceRow : targetRow;
+          loser = winner === sourceRow ? targetRow : sourceRow;
+          break;
+        case "confidence":
+          winner = (sourceRow.confidence ?? 0.8) >= (targetRow.confidence ?? 0.8) ? sourceRow : targetRow;
+          loser = winner === sourceRow ? targetRow : sourceRow;
+          break;
+        case "access":
+          winner = sourceRow.access_count >= targetRow.access_count ? sourceRow : targetRow;
+          loser = winner === sourceRow ? targetRow : sourceRow;
+          break;
+        case "manual":
+          return { success: false, winner: "", loser: "", details: "Manual resolution: choose which memory to keep." };
+      }
+
+      db.prepare("UPDATE memories SET supersedes = json_insert(COALESCE(supersedes, '[]'), '$[#], ?) WHERE id = ?")
+        .run(loser.id, winner.id);
+
+      const conflictId = `conflict_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      db.prepare(`
+        INSERT INTO conflict_log (id, source_id, target_id, conflict_type, similarity_score, resolution, resolved_at, created_at)
+        VALUES (?, ?, ?, 'resolved', 0.0, ?, ?, ?)
+      `).run(conflictId, sourceId, targetId, strategy, Date.now(), Date.now());
+
+      db.prepare("DELETE FROM memories WHERE id = ?").run(loser.id);
+      this.deleteFtsRow(db, loser.id);
+      this.deleteVecRow(db, loser.id);
+
+      return {
+        success: true,
+        winner: winner.id,
+        loser: loser.id,
+        details: `Kept ${winner.id} (${strategy} priority), removed ${loser.id}. supersedes updated.`,
+      };
+    } catch (e) { console.error("[Memory] resolveConflict error:", e); return { success: false, winner: "", loser: "", details: String(e) }; }
+  }
+
+  getConflictHistory(limit = 20): Array<{ sourceId: string; targetId: string; type: string; resolution: string | null; resolvedAt: number | null }> {
+    const db = this.projectDb;
+    if (!db) return [];
+    try {
+      const rows = db.prepare(
+        "SELECT source_id, target_id, conflict_type, resolution, resolved_at FROM conflict_log WHERE source_id IN (SELECT id FROM memories WHERE session_id = ?) OR target_id IN (SELECT id FROM memories WHERE session_id = ?) ORDER BY created_at DESC LIMIT ?"
+      ).all(this.sessionId, this.sessionId, limit) as { source_id: string; target_id: string; conflict_type: string; resolution: string | null; resolved_at: number | null }[];
+      return rows.map(r => ({ sourceId: r.source_id, targetId: r.target_id, type: r.conflict_type, resolution: r.resolution, resolvedAt: r.resolved_at }));
+    } catch { return []; }
   }
 
   // ── Memory Consolidation (Issue #11 — Gap 4) ────────────────────────────────
@@ -2079,7 +2202,7 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
       }),
 
       memory_check_conflicts: tool({
-        description: "Scan all memories for potential conflicts and contradictions. Returns pairs of memories with high similarity or opposing statements.",
+        description: "Scan memories for potential conflicts using Jaccard similarity, negation pattern analysis, and semantic embedding comparison. Returns ranked conflict list.",
         args: {
           type:  tool.schema.enum(["fact","preference","skill"]).optional(),
           layer: tool.schema.enum(["project","global"]).optional(),
@@ -2091,11 +2214,11 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
           const db = layer === "global" ? (store as unknown as { globalDb: unknown }).globalDb : (store as unknown as { projectDb: unknown }).projectDb;
           if (!db) return "No database available.";
 
-          const conflicts: Array<{ id: string; content: string; reason: string }> = [];
+          const conflicts: Array<{ id: string; content: string; reason: string; score: number }> = [];
           try {
             const rows = (db as { prepare: (s: string) => { all: (...a: unknown[]) => unknown[] } }).prepare(
-              "SELECT id, content, type FROM memories WHERE session_id = ? AND type = ?"
-            ).all(layer === "global" ? "__global__" : store.getSessionId(), checkType) as { id: string; content: string; type: string }[];
+              "SELECT id, content, type, embedding FROM memories WHERE session_id = ? AND type = ?"
+            ).all(layer === "global" ? "__global__" : store.getSessionId(), checkType) as { id: string; content: string; type: string; embedding: Buffer | null }[];
 
             for (let i = 0; i < rows.length; i++) {
               const others = rows.slice(i + 1);
@@ -2106,15 +2229,57 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
                 const overlap = [...wordsA].filter(w => wordsB.has(w)).length;
                 const jaccard = overlap / (wordsA.size + wordsB.size - overlap);
                 if (jaccard >= CONSOLIDATION_SIMILARITY) {
-                  conflicts.push({ id: other.id, content: other.content.slice(0, 120), reason: `high_similarity(jaccard=${jaccard.toFixed(2)})` });
+                  conflicts.push({ id: other.id, content: other.content.slice(0, 120), reason: `high_similarity(jaccard=${jaccard.toFixed(2)})`, score: jaccard });
+                }
+
+                const negationPatterns = [
+                  /\b(not|never|don't|doesn't|isn't|aren't|wasn't|weren't|no |without|disabled)\b/gi,
+                  /\b(use|uses|using|prefer|avoid|disable|enable|skip)\b/gi,
+                ];
+                const aHasNegation = negationPatterns.some(p => p.test(rows[i].content));
+                const bHasNegation = negationPatterns.some(p => p.test(other.content));
+                if (aHasNegation !== bHasNegation) {
+                  const sharedTerms = [...wordsA].filter(w => wordsB.has(w));
+                  if (sharedTerms.length >= 3) {
+                    conflicts.push({ id: other.id, content: other.content.slice(0, 120), reason: `possible_contradiction(shared=${sharedTerms.slice(0, 3).join(",")})`, score: sharedTerms.length / Math.max(wordsA.size, wordsB.size) });
+                  }
                 }
               }
             }
           } catch { /* ignore */ }
 
           if (conflicts.length === 0) return `No conflicts found among ${checkType} memories.`;
-          return `Found ${conflicts.length} potential conflict(s):\n` +
-            conflicts.map(c => `  - [${c.reason}] ${c.content}`).join("\n");
+          const sorted = conflicts.sort((a, b) => b.score - a.score);
+          return `Found ${sorted.length} potential conflict(s):\n` +
+            sorted.map(c => `  - [${c.reason}] (score: ${c.score.toFixed(2)}) ${c.content}`).join("\n");
+        },
+      }),
+
+      memory_resolve_conflict: tool({
+        description: "Resolve a detected conflict between two memories. Strategies: 'time' (keep newest), 'confidence' (keep highest confidence), 'access' (keep most accessed), 'manual' (user decides).",
+        args: {
+          source_id: tool.schema.string().describe("First memory ID in conflict"),
+          target_id: tool.schema.string().describe("Second memory ID in conflict"),
+          strategy:  tool.schema.enum(["time","confidence","access","manual"]).optional().describe("Resolution strategy (default: confidence)"),
+        },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const result = store.resolveConflict(args.source_id, args.target_id, (args.strategy as "time" | "confidence" | "access" | "manual") ?? "confidence");
+          return result.success ? `✅ ${result.details}` : `❌ ${result.details}`;
+        },
+      }),
+
+      memory_conflict_history: tool({
+        description: "View history of detected and resolved conflicts. Shows which memories conflicted and how they were resolved.",
+        args: {
+          limit: tool.schema.number().optional(),
+        },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const history = store.getConflictHistory(args.limit ?? 20);
+          if (history.length === 0) return "No conflict history recorded.";
+          return `Conflict History (${history.length} events):\n` +
+            history.map(h => `  - ${h.type}: ${h.sourceId} ↔ ${h.targetId} | ${h.resolution ?? "unresolved"}${h.resolvedAt ? ` (${new Date(h.resolvedAt).toISOString().split("T")[0]})` : ""}`).join("\n");
         },
       }),
 
