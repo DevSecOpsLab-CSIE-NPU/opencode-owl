@@ -137,11 +137,11 @@ interface EpisodeRow {
 
 const VALID_MEMORY_TYPES: MemoryType[] = ["fact", "experience", "preference", "skill"];
 const MAX_CONTENT_BYTES  = 10 * 1024;
-const SCHEMA_VERSION     = 9;
+const SCHEMA_VERSION     = 10;
 const DECAY_LAMBDA       = parseFloat(process.env.MEMORY_DECAY_LAMBDA ?? "0.1");
 const GLOBAL_SESSION_ID  = "__global__";
 const EMBED_DIM          = 768;
-const PACKAGE_VERSION    = "1.2.3";
+const PACKAGE_VERSION    = "1.2.4";
 const GITHUB_RELEASES_URL = "https://api.github.com/repos/DevSecOpsLab-CSIE-NPU/opencode-owl/releases/latest";
 
 // Configurable thresholds (env overrides)
@@ -587,6 +587,26 @@ class MemoryStore {
           db.exec("CREATE INDEX IF NOT EXISTS idx_trace_session ON execution_traces(session_id)");
           db.exec("CREATE INDEX IF NOT EXISTS idx_trace_tool ON execution_traces(tool_name)");
         } catch (e) { console.error("[Memory] Migration v9 error:", e); }
+      }
+
+      if (current < 10) {
+        try {
+          db.exec(`
+            CREATE TABLE IF NOT EXISTS memory_relationships (
+              id TEXT PRIMARY KEY,
+              source_id TEXT NOT NULL,
+              target_id TEXT NOT NULL,
+              relation_type TEXT NOT NULL,
+              confidence REAL DEFAULT 0.8,
+              derived_from TEXT,
+              created_at INTEGER NOT NULL
+            )
+          `);
+          db.exec("CREATE INDEX IF NOT EXISTS idx_rel_source ON memory_relationships(source_id)");
+          db.exec("CREATE INDEX IF NOT EXISTS idx_rel_target ON memory_relationships(target_id)");
+          db.exec("CREATE INDEX IF NOT EXISTS idx_rel_type ON memory_relationships(relation_type)");
+          db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_rel_unique ON memory_relationships(source_id, target_id, relation_type)");
+        } catch (e) { console.error("[Memory] Migration v10 error:", e); }
       }
 
       if (current === 0) {
@@ -2003,6 +2023,110 @@ class MemoryStore {
     } catch { return []; }
   }
 
+  // ── Knowledge Graph (Issue #15 — v1.2.4) ────────────────────────────────────
+
+  private readonly VALID_RELATIONS = ["supports", "contradicts", "elaborates", "depends_on", "supersedes", "related_to"] as const;
+
+  addRelationship(sourceId: string, targetId: string, relationType: string, confidence = 0.8, derivedFrom?: string): { success: boolean; details: string } {
+    const db = this.projectDb;
+    if (!db) return { success: false, details: "No database available." };
+    if (!this.VALID_RELATIONS.includes(relationType as typeof this.VALID_RELATIONS[number]))
+      return { success: false, details: `Invalid relation type. Must be one of: ${this.VALID_RELATIONS.join(", ")}` };
+    try {
+      const id = `rel_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      db.prepare(`
+        INSERT OR REPLACE INTO memory_relationships (id, source_id, target_id, relation_type, confidence, derived_from, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(id, sourceId, targetId, relationType, confidence, derivedFrom ?? null, Date.now());
+      return { success: true, details: `Relationship added: ${sourceId} -[${relationType}]-> ${targetId}` };
+    } catch (e) { console.error("[Memory] addRelationship error:", e); return { success: false, details: String(e) }; }
+  }
+
+  queryRelationships(memoryId: string, direction: "outgoing" | "incoming" | "both" = "outgoing", relationType?: string): Array<{ sourceId: string; targetId: string; type: string; confidence: number }> {
+    const db = this.projectDb;
+    if (!db) return [];
+    try {
+      let sql = "SELECT source_id, target_id, relation_type, confidence FROM memory_relationships WHERE ";
+      const params: (string | number)[] = [];
+      if (direction === "outgoing") { sql += "source_id = ?"; params.push(memoryId); }
+      else if (direction === "incoming") { sql += "target_id = ?"; params.push(memoryId); }
+      else { sql += "(source_id = ? OR target_id = ?)"; params.push(memoryId, memoryId); }
+      if (relationType) { sql += " AND relation_type = ?"; params.push(relationType); }
+      sql += " ORDER BY confidence DESC";
+      const rows = db.prepare(sql).all(...params) as { source_id: string; target_id: string; relation_type: string; confidence: number }[];
+      return rows.map(r => ({ sourceId: r.source_id, targetId: r.target_id, type: r.relation_type, confidence: r.confidence }));
+    } catch { return []; }
+  }
+
+  graphTraversal(startId: string, maxDepth = 3, strategy: "bfs" | "dfs" = "bfs"): Array<{ id: string; depth: number; path: string[]; relations: string[] }> {
+    const db = this.projectDb;
+    if (!db) return [];
+    const results: Array<{ id: string; depth: number; path: string[]; relations: string[] }> = [];
+    const visited = new Set<string>();
+    visited.add(startId);
+
+    const queue: Array<{ id: string; depth: number; path: string[]; relations: string[] }> = [{ id: startId, depth: 0, path: [startId], relations: [] }];
+
+    while (queue.length > 0) {
+      const current = strategy === "bfs" ? queue.shift()! : queue.pop()!;
+      if (current.depth >= maxDepth) continue;
+
+      const rels = this.queryRelationships(current.id, "outgoing");
+      for (const rel of rels) {
+        if (visited.has(rel.targetId)) continue;
+        visited.add(rel.targetId);
+        const newPath = [...current.path, rel.targetId];
+        const newRels = [...current.relations, `${rel.type}`];
+        results.push({ id: rel.targetId, depth: current.depth + 1, path: newPath, relations: newRels });
+        queue.push({ id: rel.targetId, depth: current.depth + 1, path: newPath, relations: newRels });
+      }
+    }
+
+    return results.sort((a, b) => a.depth - b.depth);
+  }
+
+  deleteRelationship(sourceId: string, targetId: string, relationType: string): { success: boolean; details: string } {
+    const db = this.projectDb;
+    if (!db) return { success: false, details: "No database available." };
+    try {
+      const result = db.prepare(
+        "DELETE FROM memory_relationships WHERE source_id = ? AND target_id = ? AND relation_type = ?"
+      ).run(sourceId, targetId, relationType);
+      return result.changes > 0
+        ? { success: true, details: `Relationship removed: ${sourceId} -[${relationType}]-> ${targetId}` }
+        : { success: false, details: "Relationship not found." };
+    } catch (e) { console.error("[Memory] deleteRelationship error:", e); return { success: false, details: String(e) }; }
+  }
+
+  exportGraph(format: "mermaid" | "graphviz" = "mermaid"): string {
+    const db = this.projectDb;
+    if (!db) return "";
+    try {
+      const rows = db.prepare(
+        "SELECT source_id, target_id, relation_type, confidence FROM memory_relationships ORDER BY confidence DESC"
+      ).all() as { source_id: string; target_id: string; relation_type: string; confidence: number }[];
+
+      if (format === "mermaid") {
+        const lines = ["graph TD"];
+        for (const r of rows) {
+          const safeSrc = r.source_id.replace(/[^a-zA-Z0-9]/g, "_");
+          const safeTgt = r.target_id.replace(/[^a-zA-Z0-9]/g, "_");
+          lines.push(`  ${safeSrc}["${r.source_id.slice(0, 20)}"] -- "${r.relation_type}" --> ${safeTgt}["${r.target_id.slice(0, 20)}"]`);
+        }
+        return lines.join("\n");
+      }
+
+      const lines = ["digraph MemoryGraph {", '  rankdir=LR;', '  node [shape=box, style=filled, fillcolor="#e8f4f8"];'];
+      for (const r of rows) {
+        const safeSrc = r.source_id.replace(/[^a-zA-Z0-9]/g, "_");
+        const safeTgt = r.target_id.replace(/[^a-zA-Z0-9]/g, "_");
+        lines.push(`  ${safeSrc} -> ${safeTgt} [label="${r.relation_type} (${r.confidence.toFixed(2)})"];`);
+      }
+      lines.push("}");
+      return lines.join("\n");
+    } catch { return ""; }
+  }
+
   // ─────────────────────────────────────────────────────────────────────────────
 
   close(): void {
@@ -2628,6 +2752,81 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
             `- Tool operations: ${m.toolOps}`,
             `- Tool success rate: ${(m.toolSuccessRate * 100).toFixed(1)}%`,
           ].join("\n");
+        },
+      }),
+
+      memory_add_relationship: tool({
+        description: "Add a relationship between two memories. Types: supports, contradicts, elaborates, depends_on, supersedes, related_to.",
+        args: {
+          source_id:     tool.schema.string(),
+          target_id:     tool.schema.string(),
+          relation_type: tool.schema.enum(["supports","contradicts","elaborates","depends_on","supersedes","related_to"]),
+          confidence:    tool.schema.number().min(0).max(1).optional(),
+          derived_from:  tool.schema.string().optional().describe("How this relationship was derived"),
+        },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const result = store.addRelationship(args.source_id, args.target_id, args.relation_type, args.confidence, args.derived_from);
+          return result.success ? `✅ ${result.details}` : `❌ ${result.details}`;
+        },
+      }),
+
+      memory_relationships: tool({
+        description: "Query relationships for a specific memory. Shows incoming, outgoing, or both.",
+        args: {
+          memory_id:     tool.schema.string(),
+          direction:     tool.schema.enum(["outgoing","incoming","both"]).optional().describe("Default: outgoing"),
+          relation_type: tool.schema.enum(["supports","contradicts","elaborates","depends_on","supersedes","related_to"]).optional(),
+        },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const rels = store.queryRelationships(args.memory_id, (args.direction as "outgoing" | "incoming" | "both") ?? "outgoing", args.relation_type);
+          if (rels.length === 0) return `No relationships found for ${args.memory_id}.`;
+          return `Relationships for ${args.memory_id}:\n` +
+            rels.map(r => `  ${r.sourceId} -[${r.type} (${r.confidence.toFixed(2)})]-> ${r.targetId}`).join("\n");
+        },
+      }),
+
+      memory_query_graph: tool({
+        description: "Traverse the memory relationship graph from a starting point. Supports BFS and DFS strategies.",
+        args: {
+          start_id:  tool.schema.string().describe("Starting memory ID"),
+          max_depth: tool.schema.number().min(1).max(10).optional().describe("Max traversal depth (default: 3)"),
+          strategy:  tool.schema.enum(["bfs","dfs"]).optional().describe("Traversal strategy (default: bfs)"),
+        },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const nodes = store.graphTraversal(args.start_id, args.max_depth ?? 3, (args.strategy as "bfs" | "dfs") ?? "bfs");
+          if (nodes.length === 0) return `No connected memories found from ${args.start_id}.`;
+          return `Graph traversal from ${args.start_id} (${nodes.length} nodes):\n` +
+            nodes.map(n => `  [depth ${n.depth}] ${n.id} via ${n.relations.join(" → ")}`).join("\n");
+        },
+      }),
+
+      memory_delete_relationship: tool({
+        description: "Remove a relationship between two memories.",
+        args: {
+          source_id:     tool.schema.string(),
+          target_id:     tool.schema.string(),
+          relation_type: tool.schema.enum(["supports","contradicts","elaborates","depends_on","supersedes","related_to"]),
+        },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const result = store.deleteRelationship(args.source_id, args.target_id, args.relation_type);
+          return result.success ? `✅ ${result.details}` : `❌ ${result.details}`;
+        },
+      }),
+
+      memory_graph_export: tool({
+        description: "Export the memory relationship graph as Mermaid or Graphviz format for visualization.",
+        args: {
+          format: tool.schema.enum(["mermaid","graphviz"]).optional().describe("Export format (default: mermaid)"),
+        },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const graph = store.exportGraph((args.format as "mermaid" | "graphviz") ?? "mermaid");
+          if (!graph) return "No relationships found to export.";
+          return graph;
         },
       }),
 
