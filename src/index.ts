@@ -1,6 +1,12 @@
 /**
  * OpenCode Memory System Plugin v7
  *
+ * Phase 8 (Issue #11 — Research Gaps):
+ *   - Memory Conflict Detection: auto-detect contradictory memories on add
+ *   - Confidence-Aware Ranking: confidence factor integrated into decay score
+ *   - Memory Consolidation: memory_consolidate tool merges similar memories
+ *   - Configurable Constants: env-based overrides for decay, archival, RRF
+ *
  * Phase 7: Version Update Flow
  *   - VersionChecker: GitHub release comparison + semver parsing
  *   - Startup notification: console + system prompt (once per version)
@@ -58,8 +64,10 @@ interface MemoryEntry {
   lastAccessedAt: number;
   memoryStrength: number;
   reinforcementCount: number;
+  confidence?: number;
   layer?: MemoryLayer;
   decayScore?: number;
+  supersedes?: string[];
 }
 
 interface SessionContext {
@@ -130,11 +138,24 @@ interface EpisodeRow {
 const VALID_MEMORY_TYPES: MemoryType[] = ["fact", "experience", "preference", "skill"];
 const MAX_CONTENT_BYTES  = 10 * 1024;
 const SCHEMA_VERSION     = 6;
-const DECAY_LAMBDA       = 0.1;
+const DECAY_LAMBDA       = parseFloat(process.env.MEMORY_DECAY_LAMBDA ?? "0.1");
 const GLOBAL_SESSION_ID  = "__global__";
 const EMBED_DIM          = 768;
-const PACKAGE_VERSION    = "0.9.1";
+const PACKAGE_VERSION    = "1.2.0";
 const GITHUB_RELEASES_URL = "https://api.github.com/repos/DevSecOpsLab-CSIE-NPU/opencode-owl/releases/latest";
+
+// Configurable thresholds (env overrides)
+const ARCHIVAL_DECAY_THRESHOLD   = parseFloat(process.env.MEMORY_ARCHIVAL_DECAY ?? "0.05");
+const ARCHIVAL_ACCESS_THRESHOLD  = parseInt(process.env.MEMORY_ARCHIVAL_ACCESS ?? "2", 10);
+const ARCHIVAL_AGE_DAYS           = parseInt(process.env.MEMORY_ARCHIVAL_AGE ?? "30", 10);
+const EXPERIENCE_CLEANUP_DAYS     = parseInt(process.env.MEMORY_EXPERIENCE_CLEANUP ?? "7", 10);
+const RRF_K                       = parseFloat(process.env.MEMORY_RRF_K ?? "60");
+const CONFIDENCE_WEIGHT           = parseFloat(process.env.MEMORY_CONFIDENCE_WEIGHT ?? "0.15");
+const CONSOLIDATION_SIMILARITY    = parseFloat(process.env.MEMORY_CONSOLIDATION_SIMILARITY ?? "0.85");
+const CONTEXT_TERM_LIMIT          = parseInt(process.env.MEMORY_CONTEXT_TERM_LIMIT ?? "5", 10);
+const CONVERSATION_HISTORY_LIMIT  = parseInt(process.env.MEMORY_CONVERSATION_LIMIT ?? "50", 10);
+const REFLECTION_THROTTLE_MS      = parseInt(process.env.MEMORY_REFLECTION_THROTTLE ?? "3600000", 10);
+const TOOL_PATTERN_MIN_REPEAT     = parseInt(process.env.MEMORY_TOOL_PATTERN_MIN ?? "3", 10);
 
 const SENSITIVE_PATTERNS: readonly RegExp[] = [
   /sk-[a-zA-Z0-9]{20,}/g,
@@ -158,16 +179,17 @@ function redactSensitiveContent(content: string): { redacted: string; hadSensiti
 
 function computeDecayScore(
   importance: number, lastAccessedAt: number,
-  accessCount: number, memoryStrength = 1.0
+  accessCount: number, memoryStrength = 1.0, confidence = 0.8
 ): number {
   const daysSince     = (Date.now() - lastAccessedAt) / 86_400_000;
   const effectiveLambda = DECAY_LAMBDA / memoryStrength;
   const recency       = Math.exp(-effectiveLambda * daysSince);
   const frequency     = Math.log(2 + accessCount);
-  return importance * recency * frequency;
+  const confidenceFactor = 1.0 + CONFIDENCE_WEIGHT * (confidence - 0.5);
+  return importance * recency * frequency * confidenceFactor;
 }
 
-function rrfMerge(listA: string[], listB: string[], k = 60): string[] {
+function rrfMerge(listA: string[], listB: string[], k = RRF_K): string[] {
   const scores = new Map<string, number>();
   listA.forEach((id, rank) => scores.set(id, (scores.get(id) ?? 0) + 1 / (k + rank + 1)));
   listB.forEach((id, rank) => scores.set(id, (scores.get(id) ?? 0) + 1 / (k + rank + 1)));
@@ -199,7 +221,7 @@ class VersionChecker {
   }
 
   async check(): Promise<UpdateInfo> {
-    if (this.latestCache && Date.now() - this.lastChecked < 3_600_000) return this.latestCache;
+    if (this.latestCache && Date.now() - this.lastChecked < REFLECTION_THROTTLE_MS) return this.latestCache;
 
     try {
       const resp = await fetch(GITHUB_RELEASES_URL, {
@@ -741,7 +763,7 @@ class MemoryStore {
 
     let results = [...resultMap.values()];
     for (const m of results) {
-      m.decayScore = computeDecayScore(m.importance, m.lastAccessedAt, m.accessCount, m.memoryStrength);
+      m.decayScore = computeDecayScore(m.importance, m.lastAccessedAt, m.accessCount, m.memoryStrength, m.confidence ?? 0.8);
     }
     results.sort((a, b) => (b.decayScore ?? 0) - (a.decayScore ?? 0));
 
@@ -783,7 +805,7 @@ class MemoryStore {
 
     let results = [...resultMap.values()];
     for (const m of results)
-      m.decayScore = computeDecayScore(m.importance, m.lastAccessedAt, m.accessCount, m.memoryStrength);
+      m.decayScore = computeDecayScore(m.importance, m.lastAccessedAt, m.accessCount, m.memoryStrength, m.confidence ?? 0.8);
     results.sort((a, b) => (b.decayScore ?? 0) - (a.decayScore ?? 0));
 
     const seen = new Set<string>();
@@ -812,7 +834,7 @@ class MemoryStore {
     if (!options.layer || options.layer === "project") fetch(this.projectDb, this.sessionId, "project");
     if (!options.layer || options.layer === "global")  fetch(this.globalDb, GLOBAL_SESSION_ID, "global");
 
-    for (const m of rows) m.decayScore = computeDecayScore(m.importance, m.lastAccessedAt, m.accessCount, m.memoryStrength);
+    for (const m of rows) m.decayScore = computeDecayScore(m.importance, m.lastAccessedAt, m.accessCount, m.memoryStrength, m.confidence ?? 0.8);
     rows.sort((a, b) => (b.decayScore ?? 0) - (a.decayScore ?? 0));
     return rows.slice(0, limit);
   }
@@ -888,8 +910,8 @@ class MemoryStore {
     for (const [db, sessId, layer] of this.allDbs()) {
       try {
         const row = db.prepare(
-          "SELECT importance, access_count, last_accessed_at, memory_strength, reinforcement_count FROM memories WHERE id = ? AND session_id = ?"
-        ).get(id, sessId) as Pick<MemoryRow, "importance" | "access_count" | "last_accessed_at" | "memory_strength" | "reinforcement_count"> | null;
+          "SELECT importance, access_count, last_accessed_at, memory_strength, reinforcement_count, confidence FROM memories WHERE id = ? AND session_id = ?"
+        ).get(id, sessId) as Pick<MemoryRow, "importance" | "access_count" | "last_accessed_at" | "memory_strength" | "reinforcement_count" | "confidence"> | null;
         if (!row) continue;
         const strength  = row.memory_strength ?? 1.0;
         const rCount    = row.reinforcement_count ?? 0;
@@ -901,7 +923,7 @@ class MemoryStore {
           access_count = access_count + 1, last_accessed_at = ?, updated_at = ?
           WHERE id = ? AND session_id = ?
         `).run(newStr, rCount + 1, now, now, id, sessId);
-        const newScore  = computeDecayScore(row.importance, now, (row.access_count ?? 0) + 1, newStr);
+        const newScore  = computeDecayScore(row.importance, now, (row.access_count ?? 0) + 1, newStr, row.confidence ?? 0.8);
         return { success: true, newStrength: newStr, newDecayScore: newScore };
       } catch (e) { console.error("[Memory] reinforceMemory error:", e); }
     }
@@ -912,17 +934,15 @@ class MemoryStore {
     const archiveFromDb = (db: Database): number => {
       let count = 0;
       try {
-        const thirtyDaysAgo = Date.now() - 30 * 86_400_000;
+        const archivalAgeCutoff = Date.now() - ARCHIVAL_AGE_DAYS * 86_400_000;
         const rows = db.prepare(`
-          SELECT * FROM memories WHERE access_count < 2 AND created_at < ?
-        `).all(thirtyDaysAgo) as MemoryRow[];
+          SELECT * FROM memories WHERE access_count < ? AND created_at < ?
+        `).all(ARCHIVAL_ACCESS_THRESHOLD, archivalAgeCutoff) as MemoryRow[];
         const now = Date.now();
         for (const row of rows) {
           const entry = this.rowToEntry(row);
-          const decayScore = computeDecayScore(
-            entry.importance, entry.lastAccessedAt, entry.accessCount, entry.memoryStrength
-          );
-          if (decayScore < 0.05) {
+          const decayScore = computeDecayScore(entry.importance, entry.lastAccessedAt, entry.accessCount, entry.memoryStrength, entry.confidence ?? 0.8);
+          if (decayScore < ARCHIVAL_DECAY_THRESHOLD) {
             try {
               db.prepare(`
                 INSERT OR REPLACE INTO archived_memories (
@@ -960,10 +980,10 @@ class MemoryStore {
     if (!db) return { projectArchived: 0 };
     let projectArchived = 0;
     try {
-      const sevenDaysAgo = Date.now() - 7 * 86_400_000;
+      const experienceCleanupCutoff = Date.now() - EXPERIENCE_CLEANUP_DAYS * 86_400_000;
       const rows = db.prepare(`
         SELECT * FROM memories WHERE type = 'experience' AND created_at < ?
-      `).all(sevenDaysAgo) as MemoryRow[];
+      `).all(experienceCleanupCutoff) as MemoryRow[];
       const now = Date.now();
       for (const row of rows) {
         try {
@@ -1241,7 +1261,7 @@ class MemoryStore {
       db.prepare(`
         DELETE FROM conversation_history
         WHERE session_id = ? AND id NOT IN (
-          SELECT id FROM conversation_history WHERE session_id = ? ORDER BY timestamp DESC LIMIT 50
+          SELECT id FROM conversation_history WHERE session_id = ? ORDER BY timestamp DESC LIMIT ${CONVERSATION_HISTORY_LIMIT}
         )
       `).run(this.sessionId, this.sessionId);
     } catch { /* ignore */ }
@@ -1289,6 +1309,7 @@ class MemoryStore {
       lastAccessedAt:     row.last_accessed_at,
       memoryStrength:     row.memory_strength     ?? 1.0,
       reinforcementCount: row.reinforcement_count ?? 0,
+      confidence:         row.confidence          ?? 0.8,
     };
   }
 
@@ -1323,13 +1344,13 @@ class MemoryStore {
 
     if (currentTask) extractTerms(currentTask, 3);
 
-    for (const msg of recentConversations.slice(0, 6)) {
+    for (const msg of recentConversations.slice(0, CONTEXT_TERM_LIMIT + 1)) {
       const snippet = msg.role === "user" ? msg.content.slice(0, 500) : msg.content.slice(0, 200);
       extractTerms(snippet, msg.role === "user" ? 1.5 : 0.5);
     }
 
     if (recentTools) {
-      for (const t of recentTools.slice(-8)) {
+      for (const t of recentTools.slice(-(CONTEXT_TERM_LIMIT + 3))) {
         const parts = t.toLowerCase().split(/[_\-\.]+/).filter(p => p.length > 3 && !STOP_WORDS.has(p));
         for (const p of parts) termFreq.set(p, (termFreq.get(p) ?? 0) + 2);
       }
@@ -1337,7 +1358,7 @@ class MemoryStore {
 
     return [...termFreq.entries()]
       .sort((a, b) => b[1] - a[1])
-      .slice(0, 5)
+      .slice(0, CONTEXT_TERM_LIMIT)
       .map(([term]) => term)
       .join(" ");
   }
@@ -1354,7 +1375,7 @@ class MemoryStore {
       }
     }
     return [...patternCounts.entries()]
-      .filter(([, count]) => count >= 3)
+      .filter(([, count]) => count >= TOOL_PATTERN_MIN_REPEAT)
       .sort((a, b) => b[1] - a[1])
       .slice(0, 5)
       .map(([seq, count]) => `"${seq}" repeated ${count}×`);
@@ -1480,6 +1501,144 @@ class MemoryStore {
       if (rows.length === 0) return null;
       return { ...this.rowToEntry(rows[0]), layer: "project" };
     } catch { return null; }
+  }
+
+  // ── Conflict Detection (Issue #11 — Gap 3) ──────────────────────────────────
+
+  detectConflicts(newContent: string, newType: MemoryType, layer: MemoryLayer): Array<{ id: string; content: string; reason: string }> {
+    const db = layer === "global" ? this.globalDb : this.projectDb;
+    if (!db) return [];
+    const sessId = layer === "global" ? GLOBAL_SESSION_ID : this.sessionId;
+    const conflicts: Array<{ id: string; content: string; reason: string }> = [];
+
+    try {
+      const rows = db.prepare(
+        "SELECT id, content, metadata, type FROM memories WHERE session_id = ? AND type = ?"
+      ).all(sessId, newType) as { id: string; content: string; metadata: string; type: string }[];
+
+      const newLower = newContent.toLowerCase();
+      const newWords = new Set(newLower.split(/\s+/).filter(w => w.length > 3));
+
+      for (const row of rows) {
+        const existingLower = row.content.toLowerCase();
+        const existingWords = new Set(existingLower.split(/\s+/).filter(w => w.length > 3));
+
+        if (existingWords.size === 0 || newWords.size === 0) continue;
+
+        const overlap = [...newWords].filter(w => existingWords.has(w)).length;
+        const jaccard = overlap / (newWords.size + existingWords.size - overlap);
+
+        if (jaccard > CONSOLIDATION_SIMILARITY) {
+          conflicts.push({
+            id: row.id,
+            content: row.content.slice(0, 120),
+            reason: `high_similarity(jaccard=${jaccard.toFixed(2)})`,
+          });
+        }
+      }
+
+      const negationPatterns = [
+        /\b(not|never|don't|doesn't|isn't|aren't|wasn't|weren't|no |without|disabled|disabled)\b/gi,
+        /\b(use|uses|using|prefer|avoid|disable|enable|skip|skip)\b/gi,
+      ];
+      const newHasNegation = negationPatterns.some(p => p.test(newContent));
+
+      for (const row of rows) {
+        const existingWords2 = new Set(row.content.toLowerCase().split(/\s+/).filter(w => w.length > 3));
+        const existingHasNegation = negationPatterns.some(p => p.test(row.content));
+        if (newHasNegation !== existingHasNegation) {
+          const sharedTerms = [...newWords].filter(w => existingWords2.has(w));
+          if (sharedTerms.length >= 3) {
+            conflicts.push({
+              id: row.id,
+              content: row.content.slice(0, 120),
+              reason: `possible_contradiction(shared_terms=${sharedTerms.join(",")})`,
+            });
+          }
+        }
+      }
+    } catch { /* ignore */ }
+
+    return conflicts;
+  }
+
+  // ── Memory Consolidation (Issue #11 — Gap 4) ────────────────────────────────
+
+  consolidateMemories(dryRun = false): { groups: number; merged: number; details: string[] } {
+    const db = this.projectDb;
+    if (!db) return { groups: 0, merged: 0, details: [] };
+
+    const details: string[] = [];
+    let merged = 0;
+    let groupCount = 0;
+
+    try {
+      const rows = db.prepare(
+        "SELECT id, content, type, session_id FROM memories WHERE session_id = ? AND type IN ('fact', 'preference') ORDER BY importance DESC"
+      ).all(this.sessionId) as { id: string; content: string; type: string; session_id: string }[];
+
+      const visited = new Set<string>();
+      const groups: string[][] = [];
+
+      for (let i = 0; i < rows.length; i++) {
+        if (visited.has(rows[i].id)) continue;
+        const group = [rows[i].id];
+        visited.add(rows[i].id);
+
+        const wordsA = new Set(rows[i].content.toLowerCase().split(/\s+/).filter(w => w.length > 3));
+
+        for (let j = i + 1; j < rows.length; j++) {
+          if (visited.has(rows[j].id)) continue;
+          if (rows[j].type !== rows[i].type) continue;
+
+          const wordsB = new Set(rows[j].content.toLowerCase().split(/\s+/).filter(w => w.length > 3));
+          if (wordsA.size === 0 || wordsB.size === 0) continue;
+
+          const overlap = [...wordsA].filter(w => wordsB.has(w)).length;
+          const jaccard = overlap / (wordsA.size + wordsB.size - overlap);
+
+          if (jaccard >= CONSOLIDATION_SIMILARITY) {
+            group.push(rows[j].id);
+            visited.add(rows[j].id);
+          }
+        }
+
+        if (group.length >= 2) groups.push(group);
+      }
+
+      groupCount = groups.length;
+
+      for (const group of groups) {
+        const keeper = group[0];
+        const toMerge = group.slice(1);
+
+        if (dryRun) {
+          details.push(`[DRY RUN] Would merge ${toMerge.length} memories into ${keeper}`);
+          merged += toMerge.length;
+          continue;
+        }
+
+        const keeperRow = db.prepare("SELECT content FROM memories WHERE id = ?").get(keeper) as { content: string } | null;
+        if (!keeperRow) continue;
+
+        for (const memId of toMerge) {
+          const mergeRow = db.prepare("SELECT content, importance FROM memories WHERE id = ? AND session_id = ?")
+            .get(memId, this.sessionId) as { content: string; importance: number } | null;
+          if (!mergeRow) continue;
+
+          const mergedContent = `${keeperRow.content}\n[consolidated] ${mergeRow.content}`;
+          db.prepare("UPDATE memories SET content = ? WHERE id = ?").run(mergedContent, keeper);
+          this.deleteFtsRow(db, memId);
+          this.deleteVecRow(db, memId);
+          db.prepare("DELETE FROM memories WHERE id = ?").run(memId);
+          merged++;
+        }
+
+        details.push(`Merged ${toMerge.length} memories into ${keeper}: "${keeperRow.content.slice(0, 60)}..."`);
+      }
+    } catch (e) { console.error("[Memory] consolidateMemories error:", e); }
+
+    return { groups: groupCount, merged, details };
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -1608,7 +1767,7 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
       if (existing) {
         const meta = existing.metadata as Record<string, unknown>;
         const age = Date.now() - ((meta.generatedAt as number) ?? 0);
-        if (age < 3_600_000) return;
+        if (age < REFLECTION_THROTTLE_MS) return;
       }
       const reflection = store.generateReflection();
       if (reflection) {
@@ -1636,7 +1795,7 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
       }),
 
       memory_add: tool({
-        description: "Add a memory. Default layer='project'. Use layer='global' for cross-project preferences. Sensitive content auto-redacted in global layer.",
+        description: "Add a memory. Default layer='project'. Use layer='global' for cross-project preferences. Sensitive content auto-redacted in global layer. Auto-detects conflicts with existing memories.",
         args: {
           type:       tool.schema.enum(["fact","preference","skill"]),
           content:    tool.schema.string().describe("Max 10KB"),
@@ -1646,9 +1805,13 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
         async execute(args, { sessionID }) {
           store.setSessionId(sid(sessionID));
           const layer = (args.layer as MemoryLayer) ?? "project";
+          const conflicts = store.detectConflicts(args.content, args.type as MemoryType, layer);
+          const conflictWarning = conflicts.length > 0
+            ? `\n⚠️ ${conflicts.length} possible conflict(s) detected:\n` + conflicts.map(c => `  - [${c.reason}] ${c.content}`).join("\n")
+            : "";
           const id = store.addMemory({ type: args.type, content: args.content,
             metadata: { addedBy: "agent" }, importance: args.importance ?? 0.5 }, layer);
-          return id ? `Memory stored: ${id} (layer: ${layer})` : "Failed to store memory.";
+          return id ? `Memory stored: ${id} (layer: ${layer})${conflictWarning}` : `Failed to store memory.${conflictWarning}`;
         },
       }),
 
@@ -1912,6 +2075,63 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
           return store.restoreMemory(args.id)
             ? `Memory ${args.id} restored to active memories.`
             : `Memory ${args.id} not found in archive.`;
+        },
+      }),
+
+      memory_check_conflicts: tool({
+        description: "Scan all memories for potential conflicts and contradictions. Returns pairs of memories with high similarity or opposing statements.",
+        args: {
+          type:  tool.schema.enum(["fact","preference","skill"]).optional(),
+          layer: tool.schema.enum(["project","global"]).optional(),
+        },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const layer = (args.layer as MemoryLayer) ?? "project";
+          const checkType = (args.type as MemoryType) ?? "fact";
+          const db = layer === "global" ? (store as unknown as { globalDb: unknown }).globalDb : (store as unknown as { projectDb: unknown }).projectDb;
+          if (!db) return "No database available.";
+
+          const conflicts: Array<{ id: string; content: string; reason: string }> = [];
+          try {
+            const rows = (db as { prepare: (s: string) => { all: (...a: unknown[]) => unknown[] } }).prepare(
+              "SELECT id, content, type FROM memories WHERE session_id = ? AND type = ?"
+            ).all(layer === "global" ? "__global__" : store.getSessionId(), checkType) as { id: string; content: string; type: string }[];
+
+            for (let i = 0; i < rows.length; i++) {
+              const others = rows.slice(i + 1);
+              const wordsA = new Set(rows[i].content.toLowerCase().split(/\s+/).filter(w => w.length > 3));
+              for (const other of others) {
+                const wordsB = new Set(other.content.toLowerCase().split(/\s+/).filter(w => w.length > 3));
+                if (wordsA.size === 0 || wordsB.size === 0) continue;
+                const overlap = [...wordsA].filter(w => wordsB.has(w)).length;
+                const jaccard = overlap / (wordsA.size + wordsB.size - overlap);
+                if (jaccard >= CONSOLIDATION_SIMILARITY) {
+                  conflicts.push({ id: other.id, content: other.content.slice(0, 120), reason: `high_similarity(jaccard=${jaccard.toFixed(2)})` });
+                }
+              }
+            }
+          } catch { /* ignore */ }
+
+          if (conflicts.length === 0) return `No conflicts found among ${checkType} memories.`;
+          return `Found ${conflicts.length} potential conflict(s):\n` +
+            conflicts.map(c => `  - [${c.reason}] ${c.content}`).join("\n");
+        },
+      }),
+
+      memory_consolidate: tool({
+        description: "Merge similar/overlapping memories to reduce redundancy. Uses Jaccard similarity on content words. Returns group count and merge count.",
+        args: {
+          dry_run: tool.schema.boolean().optional().describe("Preview merges without executing"),
+        },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const result = store.consolidateMemories(args.dry_run ?? false);
+          if (result.groups === 0) return "No similar memories found to consolidate.";
+          return [
+            `Consolidation complete: ${result.groups} group(s), ${result.merged} memories merged.`,
+            ...(args.dry_run ? ["(dry run — no changes made)"] : []),
+            ...result.details.slice(0, 10),
+          ].join("\n");
         },
       }),
 

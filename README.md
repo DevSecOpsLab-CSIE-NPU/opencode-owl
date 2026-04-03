@@ -7,18 +7,22 @@ Based on **"Memory in the Age of AI Agents: A Survey"** (arXiv:2512.13564v2) and
 ## Features
 
 - **sqlite-vec KNN Search** — 768-dim cosine distance vector search via vec0 virtual table
-- **RRF Hybrid Search** — Reciprocal Rank Fusion merges FTS5 BM25 + vector KNN results (k=60)
+- **RRF Hybrid Search** — Reciprocal Rank Fusion merges FTS5 BM25 + vector KNN results
 - **EmbeddingService** — Ollama nomic-embed-text integration with graceful FTS5-only fallback
 - **Async Vector Generation** — Non-blocking embedding via setImmediate() on add/update
 - **FTS5 Full-Text Search** — BM25-ranked search replaces `LIKE` scans; graceful fallback when unavailable
-- **Memory Decay Ranking** — `score = importance × exp(-(λ/strength) × t) × log(2 + access_count)` surfaces actively-used memories
+- **Memory Decay Ranking** — `score = importance × confidenceFactor × exp(-(λ/strength) × t) × log(2 + access_count)`
+- **Confidence-Aware Ranking** — memory confidence factor integrated into decay score (configurable weight)
 - **Memory Reinforce** — FSRS-inspired multiplicative strength boost with diminishing returns; slows decay rate per reinforcement
+- **Memory Conflict Detection** — auto-detects contradictory memories on add via Jaccard similarity + negation pattern analysis
+- **Memory Consolidation** — merge similar/overlapping memories to reduce redundancy
 - **Global / Project Layers** — cross-project preferences in `global.db`; per-repo facts in `memory.db`
 - **Privacy Filter** — regex redaction of API keys, tokens, and credentials before writing to global layer
 - **Procedural Skill Memory** — structured workflows with trigger patterns, step lists, and citation verification
 - **Episode Tracking** — record task attempts with goal/outcome/actions; lessons auto-promote to persistent facts
-- **Schema Versioning** — `schema_version` table + automatic migrations (v1 → v2 → v3 → v4 → v5)
+- **Schema Versioning** — `schema_version` table + automatic migrations (v1 → v6)
 - **CRUD Tools** — full create/read/update/delete for agent-managed memories
+- **Configurable Constants** — 12+ thresholds overridable via `MEMORY_*` env vars
 
 ## Quick Install
 
@@ -101,6 +105,13 @@ Restart OpenCode. The plugin initializes both databases on first run.
 | `memory_list_archived` | List archived memories with date, reason, and preview |
 | `memory_restore` | Restore an archived memory back to active |
 
+### Memory Quality (New in v1.2.0)
+
+| Tool | Description |
+|------|-------------|
+| `memory_check_conflicts` | Scan memories for contradictions and high-similarity duplicates |
+| `memory_consolidate` | Merge similar/overlapping memories to reduce redundancy |
+
 ## Usage Examples
 
 ```
@@ -160,7 +171,7 @@ Both databases use bun:sqlite (native SQLite with WAL mode, extension support).
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                  OpenCode Memory Plugin v5                   │
+│                  OpenCode Memory Plugin v1.2.0                 │
 ├──────────────────────────────────────────────────────────────┤
 │  Hooks                                                       │
 │  ├── chat.system.transform  → inject relevant memories       │
@@ -175,11 +186,11 @@ Both databases use bun:sqlite (native SQLite with WAL mode, extension support).
 │  └── Project DB  ~/.local/share/opencode/memory/memory.db    │
 │        per-session facts, skills, experiences, episodes      │
 ├──────────────────────────────────────────────────────────────┤
-│  Vector Components (v5)                                      │
+│  Vector Components                                           │
 │  ├── EmbeddingService  Ollama nomic-embed-text integration   │
 │  └── vec0 Engine       sqlite-vec KNN vector search          │
 ├──────────────────────────────────────────────────────────────┤
-│  Schema (v5)                                                 │
+│  Schema (v6)                                                 │
 │  ├── memories    id, type, content, citations, source,       │
 │  │               confidence, importance, decay metadata,     │
 │  │               embedding (BLOB)                            │
@@ -190,7 +201,7 @@ Both databases use bun:sqlite (native SQLite with WAL mode, extension support).
 │  ├── rowmaps     memory_fts_rowmap, memory_vec_rowmap        │
 │  ├── session_context    current task, recent tools,          │
 │  │                      current_episode_id                   │
-│  ├── conversation_history  last 50 messages per session      │
+│  ├── conversation_history  last N messages per session (configurable) │
 │  └── schema_version        migration tracking                │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -220,12 +231,14 @@ Memory retrieval uses **RRF (Reciprocal Rank Fusion)** to merge results from tex
 All merged results are final-scored by:
 
 ```
-decayScore = rrfScore × importance × exp(-(0.1 / memory_strength) × days_since_access) × log(2 + access_count)
+decayScore = rrfScore × importance × confidenceFactor × exp(-(0.1 / memory_strength) × days_since_access) × log(2 + access_count)
 ```
 
 | Component | Role |
 |-----------|------|
 | `importance` | Fixed at creation (0–1); reflects intrinsic value |
+| `confidence` | Memory reliability (0–1); default 0.8; modulates score via `confidenceFactor` |
+| `confidenceFactor` | `1.0 + 0.15 × (confidence - 0.5)`; boosts high-confidence, penalizes low-confidence |
 | `memory_strength` | Grows with `memory_reinforce` calls; modulates decay rate |
 | `days_since_access` | Updated on every retrieval (`last_accessed_at`) |
 | `access_count` | Incremented on every retrieval; reflects usage frequency |
@@ -328,7 +341,7 @@ Default port: **3100** — override with `MCP_PORT` env var.
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/rpc` | JSON-RPC 2.0 dispatch |
-| `GET`  | `/health` | `{ status: "ok", version: "v5" }` |
+| `GET`  | `/health` | `{ status: "ok", version: "v1.2.0" }` |
 | `GET`  | `/tools` | List all available tool names |
 
 ### JSON-RPC 2.0 Request Format
@@ -358,9 +371,33 @@ curl -s -X POST http://localhost:3100/rpc \
 curl -s http://localhost:3100/health
 ```
 
-Available methods: `memory_query`, `memory_add`, `memory_list`, `memory_update`, `memory_delete`, `memory_reinforce`, `memory_add_skill`, `memory_approve_skill`, `memory_validate_citations`, `memory_start_episode`, `memory_end_episode`, `memory_list_episodes`, `memory_stats`, `memory_status`
+Available methods: `memory_query`, `memory_add`, `memory_list`, `memory_update`, `memory_delete`, `memory_reinforce`, `memory_add_skill`, `memory_approve_skill`, `memory_validate_citations`, `memory_start_episode`, `memory_end_episode`, `memory_list_episodes`, `memory_stats`, `memory_status`, `memory_check_conflicts`, `memory_consolidate`
 
 The server opens the same SQLite databases as the OpenCode plugin, so memories are shared between both.
+
+## Environment Configuration
+
+All thresholds are configurable via `MEMORY_*` environment variables. Defaults match previous behavior.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MEMORY_DECAY_LAMBDA` | `0.1` | Base decay rate constant |
+| `MEMORY_ARCHIVAL_DECAY` | `0.05` | Decay score threshold for archival |
+| `MEMORY_ARCHIVAL_ACCESS` | `2` | Max access count for archival eligibility |
+| `MEMORY_ARCHIVAL_AGE` | `30` | Age in days before archival consideration |
+| `MEMORY_EXPERIENCE_CLEANUP` | `7` | Days before experience-type memories are archived |
+| `MEMORY_RRF_K` | `60` | RRF merge constant (higher = more uniform ranking) |
+| `MEMORY_CONFIDENCE_WEIGHT` | `0.15` | How much confidence affects decay score (0 = no effect) |
+| `MEMORY_CONSOLIDATION_SIMILARITY` | `0.85` | Jaccard similarity threshold for consolidation |
+| `MEMORY_CONTEXT_TERM_LIMIT` | `5` | Max terms extracted for context query |
+| `MEMORY_CONVERSATION_LIMIT` | `50` | Max conversation history entries retained |
+| `MEMORY_REFLECTION_THROTTLE` | `3600000` | Min ms between auto-reflection generations (1h) |
+| `MEMORY_TOOL_PATTERN_MIN` | `3` | Min repetitions to detect a tool pattern |
+
+Example:
+```bash
+MEMORY_DECAY_LAMBDA=0.05 MEMORY_CONFIDENCE_WEIGHT=0.3 bun run mcp
+```
 
 ## Development
 
@@ -378,6 +415,8 @@ bun run clean    # rm -rf dist node_modules
 - Paper: [AWM (ICML 2025)](https://proceedings.mlr.press/v267/wang25bx.html) — workflow pattern extraction
 - Paper: [MemoryBank (AAAI 2024)](https://arxiv.org/abs/2305.10250) — Ebbinghaus strength model, inspiration for `memory_strength`
 - Paper: [Du 2026 Survey](https://arxiv.org/abs/2603.07670) — write–manage–read memory model
+- Paper: [Anatomy of Agentic Memory](https://arxiv.org/abs/2602.19320) — evaluation gap analysis (inspired v1.2.0)
+- Paper: [MACLA](https://arxiv.org/abs/2512.18950) — hierarchical procedural memory (inspired v1.2.0 consolidation)
 - Blog: [GitHub Copilot Agentic Memory](https://github.blog/ai-and-ml/github-copilot/building-an-agentic-memory-system-for-github-copilot/) — citation-based fact storage
 - Repo: [Agent-Memory-Paper-List](https://github.com/Shichun-Liu/Agent-Memory-Paper-List)
 - Framework: [opencode-ai/opencode](https://github.com/opencode-ai/opencode)
