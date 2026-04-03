@@ -11,18 +11,24 @@ Based on **"Memory in the Age of AI Agents: A Survey"** (arXiv:2512.13564v2) and
 - **EmbeddingService** — Ollama nomic-embed-text integration with graceful FTS5-only fallback
 - **Async Vector Generation** — Non-blocking embedding via setImmediate() on add/update
 - **FTS5 Full-Text Search** — BM25-ranked search replaces `LIKE` scans; graceful fallback when unavailable
-- **Memory Decay Ranking** — `score = importance × confidenceFactor × exp(-(λ/strength) × t) × log(2 + access_count)`
+- **Memory Decay Ranking** — Multi-model decay: `exponential`, `power_law`, `step_function`, `forgetting_curve`
 - **Confidence-Aware Ranking** — memory confidence factor integrated into decay score (configurable weight)
 - **Memory Reinforce** — FSRS-inspired multiplicative strength boost with diminishing returns; slows decay rate per reinforcement
-- **Memory Conflict Detection** — auto-detects contradictory memories on add via Jaccard similarity + negation pattern analysis
-- **Memory Consolidation** — merge similar/overlapping memories to reduce redundancy
+- **Memory Conflict Detection** — auto-detects contradictory memories via Jaccard similarity + negation patterns + semantic embedding comparison
+- **Conflict Resolution** — 4 strategies: time, confidence, access, manual; auto-updates supersedes field
+- **Memory Consolidation** — Jaccard-based grouping with aggressive/moderate/conservative policies; LLM-powered summary consolidation
+- **Abstraction Hierarchy** — raw → consolidated → llm_summary; supports de-consolidation
+- **Memory Ablation Framework** — measure causal impact of specific memories on agent performance
+- **Execution Trace Recording** — automatic tool execution tracking for session analytics
+- **Knowledge Graph** — 6 relationship types (supports, contradicts, elaborates, depends_on, supersedes, related_to); BFS/DFS traversal; Mermaid/Graphviz export
+- **Adaptive Forgetting** — dynamic decay rate adjustment based on retrieval success; type-aware default models
 - **Global / Project Layers** — cross-project preferences in `global.db`; per-repo facts in `memory.db`
 - **Privacy Filter** — regex redaction of API keys, tokens, and credentials before writing to global layer
 - **Procedural Skill Memory** — structured workflows with trigger patterns, step lists, and citation verification
 - **Episode Tracking** — record task attempts with goal/outcome/actions; lessons auto-promote to persistent facts
-- **Schema Versioning** — `schema_version` table + automatic migrations (v1 → v6)
+- **Schema Versioning** — `schema_version` table + automatic migrations (v1 → v11)
 - **CRUD Tools** — full create/read/update/delete for agent-managed memories
-- **Configurable Constants** — 12+ thresholds overridable via `MEMORY_*` env vars
+- **Configurable Constants** — 15+ thresholds overridable via `MEMORY_*` env vars
 
 ## Quick Install
 
@@ -105,12 +111,52 @@ Restart OpenCode. The plugin initializes both databases on first run.
 | `memory_list_archived` | List archived memories with date, reason, and preview |
 | `memory_restore` | Restore an archived memory back to active |
 
-### Memory Quality (New in v1.2.0)
+### Memory Quality (v1.2.0)
 
 | Tool | Description |
 |------|-------------|
 | `memory_check_conflicts` | Scan memories for contradictions and high-similarity duplicates |
 | `memory_consolidate` | Merge similar/overlapping memories to reduce redundancy |
+
+### Conflict Resolution (v1.2.1)
+
+| Tool | Description |
+|------|-------------|
+| `memory_resolve_conflict` | Resolve conflicts with time/confidence/access/manual strategies |
+| `memory_conflict_history` | View history of detected and resolved conflicts |
+
+### Consolidation (v1.2.2)
+
+| Tool | Description |
+|------|-------------|
+| `memory_consolidate_with_summary` | LLM-driven consolidation with semantic abstraction |
+| `memory_deconsolidate` | Reverse consolidation, restore original structure |
+| `memory_consolidation_stats` | Consolidation analytics and space saved |
+
+### Ablation Framework (v1.2.3)
+
+| Tool | Description |
+|------|-------------|
+| `memory_ablation_test` | Measure causal impact of specific memories |
+| `memory_ablation_report` | View ablation experiment history |
+| `memory_session_metrics` | Real-time session analytics |
+
+### Knowledge Graph (v1.2.4)
+
+| Tool | Description |
+|------|-------------|
+| `memory_add_relationship` | Create relationships between memories |
+| `memory_relationships` | Query incoming/outgoing relationships |
+| `memory_query_graph` | BFS/DFS graph traversal |
+| `memory_delete_relationship` | Remove relationships |
+| `memory_graph_export` | Export as Mermaid or Graphviz |
+
+### Adaptive Forgetting (v1.2.5)
+
+| Tool | Description |
+|------|-------------|
+| `memory_forgetting_report` | Forgetting analytics dashboard |
+| `memory_set_decay_model` | Per-memory decay model override |
 
 ## Usage Examples
 
@@ -171,7 +217,7 @@ Both databases use bun:sqlite (native SQLite with WAL mode, extension support).
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                  OpenCode Memory Plugin v1.2.0                 │
+│                  OpenCode Memory Plugin v1.2.5                 │
 ├──────────────────────────────────────────────────────────────┤
 │  Hooks                                                       │
 │  ├── chat.system.transform  → inject relevant memories       │
@@ -190,7 +236,7 @@ Both databases use bun:sqlite (native SQLite with WAL mode, extension support).
 │  ├── EmbeddingService  Ollama nomic-embed-text integration   │
 │  └── vec0 Engine       sqlite-vec KNN vector search          │
 ├──────────────────────────────────────────────────────────────┤
-│  Schema (v6)                                                 │
+│  Schema (v11)                                                │
 │  ├── memories    id, type, content, citations, source,       │
 │  │               confidence, importance, decay metadata,     │
 │  │               embedding (BLOB)                            │
@@ -228,10 +274,28 @@ Memory retrieval uses **RRF (Reciprocal Rank Fusion)** to merge results from tex
 
 ### Decay Model
 
-All merged results are final-scored by:
+The plugin supports **4 decay models**, configurable globally via `MEMORY_DECAY_MODEL` or per-memory via `memory_set_decay_model`:
+
+| Model | Formula | Best For |
+|-------|---------|----------|
+| `exponential` | `exp(-(λ/strength) × t)` | Default; general-purpose |
+| `power_law` | `(1 + t)^(-λ × strength)` | Long-term stable facts |
+| `step_function` | `0.8^(t/7) / strength` | Stable preferences |
+| `forgetting_curve` | `exp(-t/(33×strength)) × (1 + 0.1×log(1+access))` | Practice-dependent skills |
+
+Default model per memory type:
+
+| Type | Default Model | Rationale |
+|------|---------------|-----------|
+| `fact` | power_law | Long-term stability |
+| `experience` | exponential | Rapid forgetting |
+| `preference` | step_function | Stable preferences |
+| `skill` | forgetting_curve | Practice-dependent |
+
+Final scoring:
 
 ```
-decayScore = rrfScore × importance × confidenceFactor × exp(-(0.1 / memory_strength) × days_since_access) × log(2 + access_count)
+decayScore = importance × recency(model) × log(2 + access_count) × confidenceFactor
 ```
 
 | Component | Role |
@@ -298,6 +362,11 @@ Matches are replaced with `[REDACTED]`; the write proceeds with sanitized conten
 | v4 | memories: +memory_strength, +reinforcement_count |
 | v5 | memories: +embedding BLOB; memory_vec vec0 virtual table; memory_vec_rowmap |
 | v6 | archived_memories table; auto-archival of low-score/old memories |
+| v7 | conflict_log table; conflict history tracking |
+| v8 | consolidation_history table; abstraction_level + source_ids columns |
+| v9 | ablation_experiments + execution_traces tables |
+| v10 | memory_relationships table (knowledge graph) |
+| v11 | forgetting_analytics table; decay_model + decay_params columns |
 
 Migrations run automatically on startup. Pre-migration backup (`.db.bak`) is created before any schema change.
 
@@ -341,7 +410,7 @@ Default port: **3100** — override with `MCP_PORT` env var.
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/rpc` | JSON-RPC 2.0 dispatch |
-| `GET`  | `/health` | `{ status: "ok", version: "v1.2.0" }` |
+| `GET`  | `/health` | `{ status: "ok", version: "v1.2.5" }` |
 | `GET`  | `/tools` | List all available tool names |
 
 ### JSON-RPC 2.0 Request Format
@@ -371,7 +440,7 @@ curl -s -X POST http://localhost:3100/rpc \
 curl -s http://localhost:3100/health
 ```
 
-Available methods: `memory_query`, `memory_add`, `memory_list`, `memory_update`, `memory_delete`, `memory_reinforce`, `memory_add_skill`, `memory_approve_skill`, `memory_validate_citations`, `memory_start_episode`, `memory_end_episode`, `memory_list_episodes`, `memory_stats`, `memory_status`, `memory_check_conflicts`, `memory_consolidate`
+Available methods: `memory_query`, `memory_add`, `memory_list`, `memory_update`, `memory_delete`, `memory_reinforce`, `memory_add_skill`, `memory_approve_skill`, `memory_validate_citations`, `memory_start_episode`, `memory_end_episode`, `memory_list_episodes`, `memory_stats`, `memory_status`, `memory_check_conflicts`, `memory_resolve_conflict`, `memory_conflict_history`, `memory_consolidate`, `memory_consolidate_with_summary`, `memory_deconsolidate`, `memory_consolidation_stats`, `memory_ablation_test`, `memory_ablation_report`, `memory_session_metrics`, `memory_add_relationship`, `memory_relationships`, `memory_query_graph`, `memory_delete_relationship`, `memory_graph_export`, `memory_forgetting_report`, `memory_set_decay_model`
 
 The server opens the same SQLite databases as the OpenCode plugin, so memories are shared between both.
 
@@ -382,6 +451,8 @@ All thresholds are configurable via `MEMORY_*` environment variables. Defaults m
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MEMORY_DECAY_LAMBDA` | `0.1` | Base decay rate constant |
+| `MEMORY_DECAY_MODEL` | `exponential` | Global decay model: exponential, power_law, step_function, forgetting_curve |
+| `MEMORY_ADAPTIVE_DECAY` | `false` | Enable dynamic decay rate adjustment based on retrieval |
 | `MEMORY_ARCHIVAL_DECAY` | `0.05` | Decay score threshold for archival |
 | `MEMORY_ARCHIVAL_ACCESS` | `2` | Max access count for archival eligibility |
 | `MEMORY_ARCHIVAL_AGE` | `30` | Age in days before archival consideration |
@@ -389,6 +460,8 @@ All thresholds are configurable via `MEMORY_*` environment variables. Defaults m
 | `MEMORY_RRF_K` | `60` | RRF merge constant (higher = more uniform ranking) |
 | `MEMORY_CONFIDENCE_WEIGHT` | `0.15` | How much confidence affects decay score (0 = no effect) |
 | `MEMORY_CONSOLIDATION_SIMILARITY` | `0.85` | Jaccard similarity threshold for consolidation |
+| `MEMORY_SEMANTIC_CONFLICT_THRESHOLD` | `0.75` | Min cosine similarity for semantic conflict detection |
+| `MEMORY_CONFLICT_RESOLUTION` | `confidence` | Default conflict resolution strategy |
 | `MEMORY_CONTEXT_TERM_LIMIT` | `5` | Max terms extracted for context query |
 | `MEMORY_CONVERSATION_LIMIT` | `50` | Max conversation history entries retained |
 | `MEMORY_REFLECTION_THROTTLE` | `3600000` | Min ms between auto-reflection generations (1h) |
@@ -417,6 +490,9 @@ bun run clean    # rm -rf dist node_modules
 - Paper: [Du 2026 Survey](https://arxiv.org/abs/2603.07670) — write–manage–read memory model
 - Paper: [Anatomy of Agentic Memory](https://arxiv.org/abs/2602.19320) — evaluation gap analysis (inspired v1.2.0)
 - Paper: [MACLA](https://arxiv.org/abs/2512.18950) — hierarchical procedural memory (inspired v1.2.0 consolidation)
+- Paper: [TiMem](https://arxiv.org/abs/2601.02845) — memory consolidation framework (inspired v1.2.2)
+- Paper: [FadeMem](https://arxiv.org/abs/2601.18642) — bio-inspired forgetting (inspired v1.2.5)
+- Paper: [Mem2ActBench](https://arxiv.org/abs/2601.19935) — memory-to-action evaluation (inspired v1.2.3)
 - Blog: [GitHub Copilot Agentic Memory](https://github.blog/ai-and-ml/github-copilot/building-an-agentic-memory-system-for-github-copilot/) — citation-based fact storage
 - Repo: [Agent-Memory-Paper-List](https://github.com/Shichun-Liu/Agent-Memory-Paper-List)
 - Framework: [opencode-ai/opencode](https://github.com/opencode-ai/opencode)
