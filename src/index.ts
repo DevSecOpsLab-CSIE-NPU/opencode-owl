@@ -137,11 +137,11 @@ interface EpisodeRow {
 
 const VALID_MEMORY_TYPES: MemoryType[] = ["fact", "experience", "preference", "skill"];
 const MAX_CONTENT_BYTES  = 10 * 1024;
-const SCHEMA_VERSION     = 10;
+const SCHEMA_VERSION     = 11;
 const DECAY_LAMBDA       = parseFloat(process.env.MEMORY_DECAY_LAMBDA ?? "0.1");
 const GLOBAL_SESSION_ID  = "__global__";
 const EMBED_DIM          = 768;
-const PACKAGE_VERSION    = "1.2.4";
+const PACKAGE_VERSION    = "1.2.5";
 const GITHUB_RELEASES_URL = "https://api.github.com/repos/DevSecOpsLab-CSIE-NPU/opencode-owl/releases/latest";
 
 // Configurable thresholds (env overrides)
@@ -158,6 +158,8 @@ const REFLECTION_THROTTLE_MS      = parseInt(process.env.MEMORY_REFLECTION_THROT
 const TOOL_PATTERN_MIN_REPEAT     = parseInt(process.env.MEMORY_TOOL_PATTERN_MIN ?? "3", 10);
 const SEMANTIC_CONFLICT_THRESHOLD = parseFloat(process.env.MEMORY_SEMANTIC_CONFLICT_THRESHOLD ?? "0.75");
 const CONFLICT_RESOLUTION_STRATEGY = process.env.MEMORY_CONFLICT_RESOLUTION ?? "confidence";
+const DECAY_MODEL                 = process.env.MEMORY_DECAY_MODEL ?? "exponential";
+const ADAPTIVE_DECAY_ENABLED      = process.env.MEMORY_ADAPTIVE_DECAY === "true";
 
 const SENSITIVE_PATTERNS: readonly RegExp[] = [
   /sk-[a-zA-Z0-9]{20,}/g,
@@ -181,14 +183,44 @@ function redactSensitiveContent(content: string): { redacted: string; hadSensiti
 
 function computeDecayScore(
   importance: number, lastAccessedAt: number,
-  accessCount: number, memoryStrength = 1.0, confidence = 0.8
+  accessCount: number, memoryStrength = 1.0, confidence = 0.8,
+  model: string = DECAY_MODEL
 ): number {
   const daysSince     = (Date.now() - lastAccessedAt) / 86_400_000;
-  const effectiveLambda = DECAY_LAMBDA / memoryStrength;
-  const recency       = Math.exp(-effectiveLambda * daysSince);
   const frequency     = Math.log(2 + accessCount);
   const confidenceFactor = 1.0 + CONFIDENCE_WEIGHT * (confidence - 0.5);
+
+  let recency: number;
+  switch (model) {
+    case "power_law":
+      recency = Math.pow(1 + daysSince, -DECAY_LAMBDA * memoryStrength);
+      break;
+    case "step_function":
+      const steps = Math.floor(daysSince / 7);
+      recency = Math.pow(0.8, steps) / memoryStrength;
+      break;
+    case "forgetting_curve":
+      const R = Math.exp(-daysSince / (33 * memoryStrength));
+      recency = R * (1 + 0.1 * Math.log(1 + accessCount));
+      break;
+    case "exponential":
+    default:
+      const effectiveLambda = DECAY_LAMBDA / memoryStrength;
+      recency = Math.exp(-effectiveLambda * daysSince);
+      break;
+  }
+
   return importance * recency * frequency * confidenceFactor;
+}
+
+function getDefaultDecayModelForType(type: MemoryType): string {
+  const modelMap: Record<MemoryType, string> = {
+    fact: "power_law",
+    experience: "exponential",
+    preference: "step_function",
+    skill: "forgetting_curve",
+  };
+  return modelMap[type] ?? "exponential";
 }
 
 function rrfMerge(listA: string[], listB: string[], k = RRF_K): string[] {
@@ -607,6 +639,28 @@ class MemoryStore {
           db.exec("CREATE INDEX IF NOT EXISTS idx_rel_type ON memory_relationships(relation_type)");
           db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_rel_unique ON memory_relationships(source_id, target_id, relation_type)");
         } catch (e) { console.error("[Memory] Migration v10 error:", e); }
+      }
+
+      if (current < 11) {
+        try {
+          try { db.exec("ALTER TABLE memories ADD COLUMN decay_model TEXT DEFAULT 'exponential'"); } catch { /* exists */ }
+          try { db.exec("ALTER TABLE memories ADD COLUMN decay_params TEXT DEFAULT '{}'"); } catch { /* exists */ }
+          db.exec(`
+            CREATE TABLE IF NOT EXISTS forgetting_analytics (
+              id TEXT PRIMARY KEY,
+              memory_id TEXT NOT NULL,
+              decay_model TEXT NOT NULL,
+              decay_rate REAL,
+              retrieval_count INTEGER DEFAULT 0,
+              retrieval_success_rate REAL,
+              adjusted_decay_rate REAL,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            )
+          `);
+          db.exec("CREATE INDEX IF NOT EXISTS idx_forgetting_memory ON forgetting_analytics(memory_id)");
+          db.exec("CREATE INDEX IF NOT EXISTS idx_forgetting_model ON forgetting_analytics(decay_model)");
+        } catch (e) { console.error("[Memory] Migration v11 error:", e); }
       }
 
       if (current === 0) {
@@ -2023,6 +2077,74 @@ class MemoryStore {
     } catch { return []; }
   }
 
+  // ── Adaptive Forgetting (Issue #16 — v1.2.5) ────────────────────────────────
+
+  getDecayModelForMemory(memoryId: string): string {
+    const db = this.projectDb;
+    if (!db) return DECAY_MODEL;
+    try {
+      const row = db.prepare("SELECT type, decay_model FROM memories WHERE id = ? AND session_id = ?")
+        .get(memoryId, this.sessionId) as { type: string; decay_model: string | null } | null;
+      if (row?.decay_model) return row.decay_model;
+      if (row?.type) return getDefaultDecayModelForType(row.type as MemoryType);
+    } catch { /* ignore */ }
+    return DECAY_MODEL;
+  }
+
+  computeDecayScoreWithModel(memoryId: string, importance: number, lastAccessedAt: number, accessCount: number, memoryStrength: number, confidence: number): number {
+    const model = this.getDecayModelForMemory(memoryId);
+    return computeDecayScore(importance, lastAccessedAt, accessCount, memoryStrength, confidence, model);
+  }
+
+  updateForgettingAnalytics(memoryId: string, retrievalSuccess: boolean): void {
+    const db = this.projectDb;
+    if (!db || !ADAPTIVE_DECAY_ENABLED) return;
+    try {
+      const existing = db.prepare("SELECT * FROM forgetting_analytics WHERE memory_id = ?")
+        .get(memoryId) as { id: string; retrieval_count: number; retrieval_success_rate: number; decay_rate: number; adjusted_decay_rate: number } | null;
+
+      if (existing) {
+        const newCount = existing.retrieval_count + 1;
+        const newRate = ((existing.retrieval_success_rate * existing.retrieval_count) + (retrievalSuccess ? 1 : 0)) / newCount;
+        const adjustedRate = existing.decay_rate * (1 - 0.05 * (newRate - 0.5));
+        db.prepare("UPDATE forgetting_analytics SET retrieval_count = ?, retrieval_success_rate = ?, adjusted_decay_rate = ?, updated_at = ? WHERE id = ?")
+          .run(newCount, newRate, adjustedRate, Date.now(), existing.id);
+      } else {
+        const id = `forgetting_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const model = this.getDecayModelForMemory(memoryId);
+        db.prepare(`
+          INSERT INTO forgetting_analytics (id, memory_id, decay_model, decay_rate, retrieval_count, retrieval_success_rate, adjusted_decay_rate, created_at, updated_at)
+          VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
+        `).run(id, memoryId, model, DECAY_LAMBDA, retrievalSuccess ? 1 : 0, DECAY_LAMBDA, Date.now(), Date.now());
+      }
+    } catch { /* ignore */ }
+  }
+
+  forgettingReport(): Array<{ memoryId: string; model: string; decayRate: number; retrievalCount: number; successRate: number; adjustedRate: number }> {
+    const db = this.projectDb;
+    if (!db) return [];
+    try {
+      const rows = db.prepare(
+        "SELECT memory_id, decay_model, decay_rate, retrieval_count, retrieval_success_rate, adjusted_decay_rate FROM forgetting_analytics ORDER BY updated_at DESC LIMIT 50"
+      ).all() as { memory_id: string; decay_model: string; decay_rate: number; retrieval_count: number; retrieval_success_rate: number; adjusted_decay_rate: number }[];
+      return rows.map(r => ({ memoryId: r.memory_id, model: r.decay_model, decayRate: r.decay_rate, retrievalCount: r.retrieval_count, successRate: r.retrieval_success_rate, adjustedRate: r.adjusted_decay_rate }));
+    } catch { return []; }
+  }
+
+  setMemoryDecayModel(memoryId: string, model: string): { success: boolean; details: string } {
+    const db = this.projectDb;
+    if (!db) return { success: false, details: "No database available." };
+    const validModels = ["exponential", "power_law", "step_function", "forgetting_curve"];
+    if (!validModels.includes(model)) return { success: false, details: `Invalid model. Must be one of: ${validModels.join(", ")}` };
+    try {
+      const result = db.prepare("UPDATE memories SET decay_model = ? WHERE id = ? AND session_id = ?")
+        .run(model, memoryId, this.sessionId);
+      return result.changes > 0
+        ? { success: true, details: `Memory ${memoryId} decay model set to ${model}.` }
+        : { success: false, details: `Memory ${memoryId} not found.` };
+    } catch (e) { console.error("[Memory] setMemoryDecayModel error:", e); return { success: false, details: String(e) }; }
+  }
+
   // ── Knowledge Graph (Issue #15 — v1.2.4) ────────────────────────────────────
 
   private readonly VALID_RELATIONS = ["supports", "contradicts", "elaborates", "depends_on", "supersedes", "related_to"] as const;
@@ -2827,6 +2949,31 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
           const graph = store.exportGraph((args.format as "mermaid" | "graphviz") ?? "mermaid");
           if (!graph) return "No relationships found to export.";
           return graph;
+        },
+      }),
+
+      memory_forgetting_report: tool({
+        description: "View forgetting analytics for all tracked memories. Shows decay model, retrieval success rate, and adjusted decay rates.",
+        args: {},
+        async execute(_, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const report = store.forgettingReport();
+          if (report.length === 0) return "No forgetting analytics data. Enable with MEMORY_ADAPTIVE_DECAY=true.";
+          return `Forgetting Report (${report.length} memories):\n` +
+            report.map(r => `  - ${r.memoryId}: model=${r.model}, rate=${r.decayRate.toFixed(3)}, retrievals=${r.retrievalCount}, success=${(r.successRate * 100).toFixed(0)}%, adjusted=${r.adjustedRate.toFixed(3)}`).join("\n");
+        },
+      }),
+
+      memory_set_decay_model: tool({
+        description: "Set the decay model for a specific memory. Models: exponential, power_law, step_function, forgetting_curve.",
+        args: {
+          memory_id: tool.schema.string(),
+          model:     tool.schema.enum(["exponential","power_law","step_function","forgetting_curve"]),
+        },
+        async execute(args, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          const result = store.setMemoryDecayModel(args.memory_id, args.model);
+          return result.success ? `✅ ${result.details}` : `❌ ${result.details}`;
         },
       }),
 
