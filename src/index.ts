@@ -47,6 +47,109 @@ import { exec } from "child_process";
 import { promisify } from "util";
 const execAsync = promisify(exec);
 
+interface TUIStatusResponse {
+  isAvailable: boolean;
+  hitRate: number;
+  color: "green" | "yellow" | "red" | "gray";
+  label: string;
+  shortLabel: string;
+  tooltip: {
+    title: string;
+    lines: string[];
+  };
+  lastUpdate: number;
+  responseTime: number;
+}
+
+class OwlStatusManager {
+  private cachedStatus: { data: TUIStatusResponse; timestamp: number } | null = null;
+  private readonly CACHE_TTL_MS = 60000;
+  private readonly MCP_ENDPOINT = "http://localhost:3100/rpc";
+  private readonly TIMEOUT_MS = 1500;
+
+  async getStatus(): Promise<TUIStatusResponse | null> {
+    const now = Date.now();
+    if (this.cachedStatus && now - this.cachedStatus.timestamp < this.CACHE_TTL_MS) {
+      return this.cachedStatus.data;
+    }
+
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), this.TIMEOUT_MS);
+
+      const response = await fetch(this.MCP_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          method: "memory_tui_status",
+          params: {},
+          id: 1,
+        }),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        return this.getUnavailableStatus();
+      }
+
+      const data = (await response.json()) as {
+        result?: TUIStatusResponse;
+        error?: unknown;
+      };
+      const status = data.result;
+
+      if (!status) {
+        return this.getUnavailableStatus();
+      }
+
+      this.cachedStatus = {
+        data: status,
+        timestamp: now,
+      };
+
+      return status;
+    } catch (err) {
+      console.debug("[Owl TUI] Fetch failed:", err instanceof Error ? err.message : String(err));
+      return this.getUnavailableStatus();
+    }
+  }
+
+  private getUnavailableStatus(): TUIStatusResponse {
+    return {
+      isAvailable: false,
+      hitRate: 0,
+      color: "gray",
+      label: "owl (—)",
+      shortLabel: "owl",
+      tooltip: {
+        title: "OpenCode-Owl Memory System",
+        lines: [
+          "Status: ⚠ Service Unavailable",
+          "Check if MCP server is running",
+          "Port: 3100",
+        ],
+      },
+      lastUpdate: Date.now(),
+      responseTime: 0,
+    };
+  }
+
+  formatStatus(status: TUIStatusResponse): string {
+    const lines = [
+      `Status: ${status.label}`,
+      `Hit Rate: ${(status.hitRate * 100).toFixed(1)}%`,
+      `Available: ${status.isAvailable ? "✅" : "⚠️"}`,
+      "",
+      status.tooltip.title,
+      ...status.tooltip.lines,
+    ];
+    return lines.join("\n");
+  }
+}
+
 type MemoryType   = "fact" | "experience" | "preference" | "skill";
 type MemoryLayer  = "global" | "project";
 type RowParam     = string | number | null;
@@ -2271,6 +2374,9 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
   store.initialize();
   console.log(`[Memory] v${PACKAGE_VERSION} (schema v${SCHEMA_VERSION}) initialized | project: ${projectDbPath} | global: ${globalDbPath}`);
 
+  const statusManager = new OwlStatusManager();
+  let cachedStatus: TUIStatusResponse | null = null;
+
   const versionChecker = new VersionChecker(PACKAGE_VERSION);
   let updateNotification: string | null = null;
   let updateShownInPrompt = false;
@@ -3077,6 +3183,24 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
               `Try manual update: curl -fsSL https://raw.githubusercontent.com/DevSecOpsLab-CSIE-NPU/opencode-owl/main/update.sh | bash`,
             ].join("\n");
           }
+        },
+      }),
+
+      "owl:status": tool({
+        description: "Get OpenCode-Owl memory system status including hit rate and MCP server availability.",
+        args: {},
+        async execute(_, { sessionID }) {
+          store.setSessionId(sid(sessionID));
+          if (!cachedStatus) {
+            cachedStatus = await statusManager.getStatus();
+          }
+
+          const status = cachedStatus ?? (await statusManager.getStatus());
+          if (status) {
+            cachedStatus = status;
+            return statusManager.formatStatus(status);
+          }
+          return "Error: Failed to fetch memory status. Check if MCP server is running on port 3100.";
         },
       }),
     },
