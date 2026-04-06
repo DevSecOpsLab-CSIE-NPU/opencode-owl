@@ -18,6 +18,7 @@ import * as sqliteVec from "sqlite-vec";
 import { join } from "path";
 import { mkdirSync, existsSync } from "fs";
 import { homedir } from "os";
+import { ValidationFramework } from "./validation-framework";
 
 type MemoryType     = "fact" | "experience" | "preference" | "skill";
 type MemoryLayer    = "global" | "project";
@@ -189,6 +190,7 @@ class MemoryStore {
   private fts5Available = false;
   private vecAvailable  = false;
   private readonly embedder = new EmbeddingService();
+  private validation: ValidationFramework | null = null;
 
   constructor(projectDbPath: string, globalDbPath: string) {
     this.projectDbPath = projectDbPath;
@@ -211,6 +213,10 @@ class MemoryStore {
       this.globalDb = new Database(this.globalDbPath);
       this.tryLoadVec(this.globalDb);
       this.initSchemaForDb(this.globalDb, true);
+
+      if (this.projectDb) {
+        this.validation = new ValidationFramework(this.projectDb, this.globalDb || undefined);
+      }
     } catch (err) {
       console.error("[Memory] Initialization failed:", err);
     }
@@ -923,6 +929,22 @@ class MemoryStore {
     }
   }
 
+  async getValidationReport(daysBack: number = 7, format: "markdown" | "json" = "json"): Promise<Record<string, unknown> | string> {
+    if (!this.validation || !this.projectDb) {
+      return { error: "Validation framework not initialized" };
+    }
+    try {
+      const report = await this.validation.generateValidationReport(daysBack);
+      if (format === "markdown") {
+        return this.validation.formatReportAsMarkdown(report);
+      }
+      return JSON.parse(this.validation.formatReportAsJSON(report));
+    } catch (e) {
+      console.error("[Memory] getValidationReport error:", e);
+      return { error: String(e) };
+    }
+  }
+
   getStats(): { total: number; byType: Record<string, number>; avgImportance: number; globalTotal: number } {
     const count = (db: Database | null, sessId: string) => {
       if (!db) return { total: 0, byType: {} as Record<string, number>, avg: 0 };
@@ -1003,6 +1025,7 @@ const TOOL_NAMES = [
   "memory_reinforce", "memory_add_skill", "memory_approve_skill", "memory_validate_citations",
   "memory_start_episode", "memory_end_episode", "memory_list_episodes",
   "memory_stats", "memory_status",
+  "memory_validation_report", "memory_hitrate", "memory_access_analytics",
 ];
 
 function defaultSessionId(): string {
@@ -1143,15 +1166,21 @@ async function dispatch(
        return store.getHitRate(hours, layer);
      }
 
-     case "memory_access_analytics": {
-       const layer = (params.layer as "project" | "global") ?? "project";
-       return store.getAccessAnalytics(layer);
-     }
+      case "memory_access_analytics": {
+        const layer = (params.layer as "project" | "global") ?? "project";
+        return store.getAccessAnalytics(layer);
+      }
 
-     default:
-      throw Object.assign(new Error(`Method not found: ${method}`), { code: -32601 });
-  }
-}
+      case "memory_validation_report": {
+        const daysBack = (params.days_back as number) ?? 7;
+        const format = (params.format as "markdown" | "json") ?? "json";
+        return await store.getValidationReport(daysBack, format);
+      }
+
+      default:
+       throw Object.assign(new Error(`Method not found: ${method}`), { code: -32601 });
+   }
+ }
 
 export function createMcpServer(): ReturnType<typeof Bun.serve> {
   const port = Number(process.env.MCP_PORT ?? 3100);
