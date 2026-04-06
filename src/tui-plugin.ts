@@ -114,11 +114,26 @@ class OwlStatusManager {
 
 export async function tuiPlugin(api: any, options: any, meta: any): Promise<void> {
   const statusManager = new OwlStatusManager();
+  let cachedStatusText = "owl (…)";
+  let cachedColor = "gray";
+
+  const updateStatusDisplay = async () => {
+    const status = await statusManager.getStatus();
+    if (status) {
+      cachedStatusText = status.label;
+      cachedColor = status.color;
+    } else {
+      cachedStatusText = "owl (—)";
+      cachedColor = "gray";
+    }
+  };
 
   api.slots.register({
     name: "owl_status_provider",
     render: () => {
-      return "";
+      const colorCode = statusManager.getColorCode(cachedColor);
+      const resetCode = statusManager.getResetCode();
+      return `${colorCode}${cachedStatusText}${resetCode}`;
     },
     slots: {},
   });
@@ -128,22 +143,21 @@ export async function tuiPlugin(api: any, options: any, meta: any): Promise<void
       title: "Refresh Owl Memory Status",
       value: "owl:refresh-status",
       category: "owl",
-      description: "Refresh the memory system status display",
-      onSelect: () => {
-        console.log("[Owl] Refreshing status cache");
+      description: "Force refresh memory system status",
+      onSelect: async () => {
+        await updateStatusDisplay();
+        console.log(`[Owl] Status refreshed: ${cachedStatusText}`);
       },
     },
   ]);
 
   api.lifecycle.onDispose(unregisterCommand);
 
-  setImmediate(async () => {
-    const status = await statusManager.getStatus();
-    if (status) {
-      const colorCode = statusManager.getColorCode(status.color);
-      const resetCode = statusManager.getResetCode();
-      console.log(`[Owl] Status: ${colorCode}${status.label}${resetCode}`);
-    }
+  await updateStatusDisplay();
+
+  setImmediate(() => {
+    const intervalId = setInterval(updateStatusDisplay, 60000);
+    api.lifecycle.onDispose(() => clearInterval(intervalId));
   });
 }
 
