@@ -260,10 +260,28 @@ class MemoryStore {
           last_accessed_at INTEGER NOT NULL
         )
       `);
-      db.exec("CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id)");
-      db.exec("CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type)");
+       db.exec("CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id)");
+       db.exec("CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type)");
 
-      if (!isGlobal) {
+       db.exec(`
+         CREATE TABLE IF NOT EXISTS memory_access_log (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           memory_id TEXT,
+           session_id TEXT NOT NULL,
+           access_type TEXT NOT NULL,
+           query_text TEXT,
+           result_rank INTEGER,
+           relevance_score REAL,
+           timestamp INTEGER NOT NULL,
+           FOREIGN KEY(memory_id) REFERENCES memories(id)
+         )
+       `);
+       db.exec("CREATE INDEX IF NOT EXISTS idx_access_log_memory ON memory_access_log(memory_id)");
+       db.exec("CREATE INDEX IF NOT EXISTS idx_access_log_session ON memory_access_log(session_id)");
+       db.exec("CREATE INDEX IF NOT EXISTS idx_access_log_time ON memory_access_log(timestamp)");
+       db.exec("CREATE INDEX IF NOT EXISTS idx_access_log_type ON memory_access_log(access_type)");
+
+       if (!isGlobal) {
         db.exec(`
           CREATE TABLE IF NOT EXISTS session_context (
             session_id TEXT PRIMARY KEY, current_task TEXT,
@@ -434,15 +452,41 @@ class MemoryStore {
   }
 
   private bumpAccessStats(db: Database, ids: string[]): void {
-    if (ids.length === 0) return;
-    const now  = Date.now();
-    const stmt = db.prepare("UPDATE memories SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?");
-    for (const id of ids) {
-      try { stmt.run(now, id); } catch { /* ignore */ }
-    }
-  }
+     if (ids.length === 0) return;
+     const now  = Date.now();
+     const stmt = db.prepare("UPDATE memories SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?");
+     for (const id of ids) {
+       try { stmt.run(now, id); } catch { /* ignore */ }
+     }
+   }
 
-  addMemory(
+   private logAccess(db: Database | null, sessionId: string, log: {
+     memory_id: string | null;
+     access_type: string;
+     query_text?: string | null;
+     result_rank?: number | null;
+     relevance_score?: number | null;
+   }): void {
+     if (!db) return;
+     try {
+       db.prepare(`
+         INSERT INTO memory_access_log (memory_id, session_id, access_type, query_text, result_rank, relevance_score, timestamp)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+       `).run(
+         log.memory_id,
+         sessionId,
+         log.access_type,
+         log.query_text ?? null,
+         log.result_rank ?? null,
+         log.relevance_score ?? null,
+         Date.now()
+       );
+     } catch (e) {
+       console.error("[Memory] logAccess error:", e);
+     }
+   }
+
+   addMemory(
     entry: Omit<MemoryEntry, "id" | "accessCount" | "createdAt" | "updatedAt" | "lastAccessedAt"
                | "memoryStrength" | "reinforcementCount" | "layer" | "decayScore">,
     layer: MemoryLayer = "project"
@@ -474,13 +518,14 @@ class MemoryStore {
       const finalContent = content;
       const finalId      = id;
       const finalSessId  = sessId;
-      setImmediate(async () => {
-        const vec = await this.embedder.embed(finalContent);
-        if (vec) this.insertVecRow(db, finalId, finalSessId, vec);
-      });
+       setImmediate(async () => {
+         const vec = await this.embedder.embed(finalContent);
+         if (vec) this.insertVecRow(db, finalId, finalSessId, vec);
+       });
 
-      return id;
-    } catch (e) { console.error("[Memory] addMemory error:", e); return ""; }
+       this.logAccess(db, sessId, { memory_id: id, access_type: "added" });
+       return id;
+     } catch (e) { console.error("[Memory] addMemory error:", e); return ""; }
   }
 
   queryMemories(options: {
@@ -542,18 +587,44 @@ class MemoryStore {
     if (this.projectDb) this.bumpAccessStats(this.projectDb, bumpIds.filter(id => resultMap.get(id)?.layer === "project"));
     if (this.globalDb)  this.bumpAccessStats(this.globalDb,  bumpIds.filter(id => resultMap.get(id)?.layer === "global"));
 
-    let results = [...resultMap.values()];
-    for (const m of results)
-      m.decayScore = computeDecayScore(m.importance, m.lastAccessedAt, m.accessCount, m.memoryStrength);
-    results.sort((a, b) => (b.decayScore ?? 0) - (a.decayScore ?? 0));
+     let results = [...resultMap.values()];
+     for (const m of results)
+       m.decayScore = computeDecayScore(m.importance, m.lastAccessedAt, m.accessCount, m.memoryStrength);
+     results.sort((a, b) => (b.decayScore ?? 0) - (a.decayScore ?? 0));
 
-    const seen = new Set<string>();
-    const deduped: MemoryEntry[] = [];
-    for (const m of results) {
-      const key = m.content.trim().toLowerCase();
-      if (!seen.has(key)) { seen.add(key); deduped.push(m); }
-    }
-    return deduped.slice(0, limit);
+     const seen = new Set<string>();
+     const deduped: MemoryEntry[] = [];
+     for (const m of results) {
+       const key = m.content.trim().toLowerCase();
+       if (!seen.has(key)) { seen.add(key); deduped.push(m); }
+     }
+     
+     const finalResults = deduped.slice(0, limit);
+     
+     if (finalResults.length === 0 && options.search) {
+       this.logAccess(this.projectDb, this.sessionId, {
+         memory_id: null,
+         access_type: "query_miss",
+         query_text: options.search
+       });
+     } else {
+       for (let i = 0; i < finalResults.length; i++) {
+         const m = finalResults[i];
+         this.logAccess(
+           m.layer === "global" ? this.globalDb : this.projectDb,
+           m.layer === "global" ? GLOBAL_SESSION_ID : this.sessionId,
+           {
+             memory_id: m.id,
+             access_type: i < 3 ? "query_hit" : "partial_hit",
+             query_text: options.search,
+             result_rank: i + 1,
+             relevance_score: m.decayScore ?? 0
+           }
+         );
+       }
+     }
+     
+     return finalResults;
   }
 
   listMemories(options: { type?: string; limit?: number; layer?: MemoryLayer } = {}): MemoryEntry[] {
@@ -638,13 +709,14 @@ class MemoryStore {
         const growth   = Math.max(1.2, 1.8 - 0.2 * rCount);
         const newStr   = Math.min(10.0, strength * growth);
         const now      = Date.now();
-        db.prepare(`
-          UPDATE memories SET memory_strength = ?, reinforcement_count = ?,
-          access_count = access_count + 1, last_accessed_at = ?, updated_at = ?
-          WHERE id = ? AND session_id = ?
-        `).run(newStr, rCount + 1, now, now, id, sessId);
-        const newScore = computeDecayScore(row.importance, now, (row.access_count ?? 0) + 1, newStr);
-        return { success: true, newStrength: newStr, newDecayScore: newScore };
+         db.prepare(`
+           UPDATE memories SET memory_strength = ?, reinforcement_count = ?,
+           access_count = access_count + 1, last_accessed_at = ?, updated_at = ?
+           WHERE id = ? AND session_id = ?
+         `).run(newStr, rCount + 1, now, now, id, sessId);
+         const newScore = computeDecayScore(row.importance, now, (row.access_count ?? 0) + 1, newStr);
+         this.logAccess(db, sessId, { memory_id: id, access_type: "reinforced" });
+         return { success: true, newStrength: newStr, newDecayScore: newScore };
       } catch (e) { console.error("[Memory] reinforceMemory error:", e); }
     }
     return notFound;
@@ -812,6 +884,43 @@ class MemoryStore {
                updates.conversationSummary ?? null, updates.currentEpisodeId ?? null, now);
       }
     } catch (e) { console.error("[Memory] updateSessionContext error:", e); }
+  }
+
+  getHitRate(hours: number = 24, layer: "project" | "global" = "project"): { total: number; hits: number; hitRate: string; hours: number } {
+    const db = layer === "global" ? this.globalDb : this.projectDb;
+    const sessId = layer === "global" ? GLOBAL_SESSION_ID : this.sessionId;
+    if (!db) return { total: 0, hits: 0, hitRate: "0.00%", hours };
+    try {
+      const since = Date.now() - hours * 3600000;
+      const total = (db.prepare("SELECT COUNT(*) as c FROM memory_access_log WHERE session_id = ? AND timestamp > ?").get(sessId, since) as any)?.c || 0;
+      const hits = (db.prepare("SELECT COUNT(*) as c FROM memory_access_log WHERE session_id = ? AND access_type = 'query_hit' AND timestamp > ?").get(sessId, since) as any)?.c || 0;
+      const rate = total > 0 ? ((hits / total) * 100).toFixed(2) : "0.00";
+      return { total, hits, hitRate: rate + "%", hours };
+    } catch { return { total: 0, hits: 0, hitRate: "0.00%", hours }; }
+  }
+
+  getAccessAnalytics(layer: "project" | "global" = "project"): Record<string, any> {
+    const db = layer === "global" ? this.globalDb : this.projectDb;
+    const sessId = layer === "global" ? GLOBAL_SESSION_ID : this.sessionId;
+    if (!db) return { error: "Database not available" };
+    try {
+      const since = Date.now() - 24 * 3600000;
+      const total = (db.prepare("SELECT COUNT(*) as c FROM memory_access_log WHERE session_id = ? AND timestamp > ?").get(sessId, since) as any)?.c || 0;
+      const hits = (db.prepare("SELECT COUNT(*) as c FROM memory_access_log WHERE session_id = ? AND access_type = 'query_hit' AND timestamp > ?").get(sessId, since) as any)?.c || 0;
+      const topHitMemories = db.prepare("SELECT memory_id, COUNT(*) as hits FROM memory_access_log WHERE access_type IN ('query_hit', 'partial_hit') AND session_id = ? GROUP BY memory_id ORDER BY hits DESC LIMIT 10").all(sessId) as any[];
+      const avgRow = db.prepare("SELECT AVG(relevance_score) as avg FROM memory_access_log WHERE access_type IN ('query_hit', 'partial_hit') AND session_id = ?").get(sessId) as any;
+      const missPatterns = db.prepare("SELECT query_text, COUNT(*) as misses FROM memory_access_log WHERE access_type = 'query_miss' AND session_id = ? GROUP BY query_text ORDER BY misses DESC LIMIT 10").all(sessId) as any[];
+      return {
+        hitRate: total > 0 ? ((hits / total) * 100).toFixed(2) + "%" : "0.00%",
+        totalQueries: total,
+        topHitMemories,
+        averageRelevance: avgRow?.avg || 0,
+        missPatterns
+      };
+    } catch (e) {
+      console.error("[Memory] getAccessAnalytics error:", e);
+      return { error: String(e) };
+    }
   }
 
   getStats(): { total: number; byType: Record<string, number>; avgImportance: number; globalTotal: number } {
@@ -1017,18 +1126,29 @@ async function dispatch(
       };
     }
 
-    case "memory_status": {
-      const s   = store.getStats();
-      const ctx = store.getSessionContext();
-      return {
-        summary: `🧠 Project: ${s.total} | Global: ${s.globalTotal} | 🎯 ${ctx?.currentTask ?? "No task"} | 🔧 ${ctx?.recentTools?.slice(-3).join(", ") ?? "None"}`,
-        project: s.total,
-        global:  s.globalTotal,
-        currentTask: ctx?.currentTask ?? null,
-      };
-    }
+     case "memory_status": {
+       const s   = store.getStats();
+       const ctx = store.getSessionContext();
+       return {
+         summary: `🧠 Project: ${s.total} | Global: ${s.globalTotal} | 🎯 ${ctx?.currentTask ?? "No task"} | 🔧 ${ctx?.recentTools?.slice(-3).join(", ") ?? "None"}`,
+         project: s.total,
+         global:  s.globalTotal,
+         currentTask: ctx?.currentTask ?? null,
+       };
+     }
 
-    default:
+     case "memory_hitrate": {
+       const hours = (params.hours as number) ?? 24;
+       const layer = (params.layer as "project" | "global") ?? "project";
+       return store.getHitRate(hours, layer);
+     }
+
+     case "memory_access_analytics": {
+       const layer = (params.layer as "project" | "global") ?? "project";
+       return store.getAccessAnalytics(layer);
+     }
+
+     default:
       throw Object.assign(new Error(`Method not found: ${method}`), { code: -32601 });
   }
 }
