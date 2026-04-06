@@ -3083,11 +3083,4 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
   };
 };
 
-import { tuiPlugin } from "./tui-plugin.js";
-
-export const TuiPluginModule = {
-  id: "opencode-owl-tui",
-  tui: tuiPlugin,
-};
-
 export default MemoryPlugin;
