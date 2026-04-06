@@ -1,3 +1,6 @@
+import type { Hooks } from "@opencode-ai/plugin";
+import { z } from "zod";
+
 interface TUIStatusResponse {
   isAvailable: boolean;
   hitRate: number;
@@ -93,72 +96,66 @@ class OwlStatusManager {
     };
   }
 
-  getColorCode(color: string): string {
-    const codes: Record<string, string> = {
-      green: "\x1b[32m",
-      yellow: "\x1b[33m",
-      red: "\x1b[31m",
-      gray: "\x1b[90m",
+  formatStatusLine(status: TUIStatusResponse): string {
+    const emoji = this.getStatusEmoji(status.color);
+    return `${emoji} owl ${status.label.replace("owl ", "")}`;
+  }
+
+  private getStatusEmoji(color: string): string {
+    const emojis: Record<string, string> = {
+      green: "✅",
+      yellow: "⚠️",
+      red: "❌",
+      gray: "⊙",
     };
-    return codes[color] ?? "\x1b[90m";
+    return emojis[color] ?? "⊙";
   }
 
-  getResetCode(): string {
-    return "\x1b[0m";
-  }
-
-  formatTooltip(tooltip: TUIStatusResponse["tooltip"]): string {
-    return [tooltip.title, ...tooltip.lines].join("\n");
+  formatTooltip(status: TUIStatusResponse): string {
+    return [status.tooltip.title, "", ...status.tooltip.lines].join("\n");
   }
 }
 
-export async function tuiPlugin(api: any, options: any, meta: any): Promise<void> {
-  const statusManager = new OwlStatusManager();
-  let cachedStatusText = "owl (…)";
-  let cachedColor = "gray";
+const statusManager = new OwlStatusManager();
+let cachedStatus: TUIStatusResponse | null = null;
+let lastStatusFetch = 0;
 
-  const updateStatusDisplay = async () => {
-    const status = await statusManager.getStatus();
-    if (status) {
-      cachedStatusText = status.label;
-      cachedColor = status.color;
-    } else {
-      cachedStatusText = "owl (—)";
-      cachedColor = "gray";
-    }
-  };
+async function refreshStatus(): Promise<void> {
+  const now = Date.now();
+  if (lastStatusFetch && now - lastStatusFetch < 1000) return;
+  lastStatusFetch = now;
+  cachedStatus = await statusManager.getStatus();
+}
 
-  api.slots.register({
-    name: "owl_status_provider",
-    render: () => {
-      const colorCode = statusManager.getColorCode(cachedColor);
-      const resetCode = statusManager.getResetCode();
-      return `${colorCode}${cachedStatusText}${resetCode}`;
-    },
-    slots: {},
-  });
+refreshStatus().catch(err => console.error("[Owl] Init error:", err));
+setInterval(() => refreshStatus().catch(err => console.error("[Owl] Refresh error:", err)), 60000);
 
-  const unregisterCommand = api.command.register(() => [
-    {
-      title: "Refresh Owl Memory Status",
-      value: "owl:refresh-status",
-      category: "owl",
-      description: "Force refresh memory system status",
-      onSelect: async () => {
-        await updateStatusDisplay();
-        console.log(`[Owl] Status refreshed: ${cachedStatusText}`);
+export default async function MemoryPlugin(): Promise<Hooks> {
+  return {
+    tool: {
+      "owl:status": {
+        description: "Get OpenCode-Owl memory system status",
+        args: z.object({}).passthrough() as any,
+        execute: async () => {
+          if (!cachedStatus) {
+            await refreshStatus();
+          }
+
+          const status = cachedStatus ?? (await statusManager.getStatus());
+          if (status) {
+            cachedStatus = status;
+            const lines = [
+              `Status: ${status.label}`,
+              `Hit Rate: ${(status.hitRate * 100).toFixed(1)}%`,
+              `Available: ${status.isAvailable ? "✅" : "❌"}`,
+              "",
+              statusManager.formatTooltip(status),
+            ];
+            return lines.join("\n");
+          }
+          return "Error: Failed to fetch memory status. Check if MCP server is running on port 3100.";
+        },
       },
     },
-  ]);
-
-  api.lifecycle.onDispose(unregisterCommand);
-
-  await updateStatusDisplay();
-
-  setImmediate(() => {
-    const intervalId = setInterval(updateStatusDisplay, 60000);
-    api.lifecycle.onDispose(() => clearInterval(intervalId));
-  });
+  };
 }
-
-export default tuiPlugin;
