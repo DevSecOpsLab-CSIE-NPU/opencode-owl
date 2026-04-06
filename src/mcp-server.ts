@@ -19,6 +19,7 @@ import { join } from "path";
 import { mkdirSync, existsSync } from "fs";
 import { homedir } from "os";
 import { ValidationFramework } from "./validation-framework";
+import { TUIStatusManager } from "./tui-status";
 
 type MemoryType     = "fact" | "experience" | "preference" | "skill";
 type MemoryLayer    = "global" | "project";
@@ -191,6 +192,7 @@ class MemoryStore {
   private vecAvailable  = false;
   private readonly embedder = new EmbeddingService();
   private validation: ValidationFramework | null = null;
+  private tuiStatus: TUIStatusManager | null = null;
 
   constructor(projectDbPath: string, globalDbPath: string) {
     this.projectDbPath = projectDbPath;
@@ -216,6 +218,7 @@ class MemoryStore {
 
       if (this.projectDb) {
         this.validation = new ValidationFramework(this.projectDb, this.globalDb || undefined);
+        this.tuiStatus = new TUIStatusManager(this.projectDb);
       }
     } catch (err) {
       console.error("[Memory] Initialization failed:", err);
@@ -945,6 +948,34 @@ class MemoryStore {
     }
   }
 
+  async getTUIStatus(): Promise<Record<string, unknown>> {
+    if (!this.tuiStatus) {
+      return {
+        error: "TUI status manager not initialized",
+        isAvailable: false,
+        label: "owl (--%) ",
+        color: "gray",
+      };
+    }
+    try {
+      const status = await this.tuiStatus.getStatus();
+      return {
+        isAvailable: status.isAvailable,
+        hitRate: status.hitRate,
+        color: status.color,
+        label: status.label,
+        shortLabel: status.shortLabel,
+        tooltip: status.tooltip,
+        lastUpdate: status.lastUpdate,
+        responseTime: status.responseTime,
+        cache: this.tuiStatus.getCacheInfo(),
+      };
+    } catch (e) {
+      console.error("[Memory] getTUIStatus error:", e);
+      return { error: String(e) };
+    }
+  }
+
   getStats(): { total: number; byType: Record<string, number>; avgImportance: number; globalTotal: number } {
     const count = (db: Database | null, sessId: string) => {
       if (!db) return { total: 0, byType: {} as Record<string, number>, avg: 0 };
@@ -1026,6 +1057,7 @@ const TOOL_NAMES = [
   "memory_start_episode", "memory_end_episode", "memory_list_episodes",
   "memory_stats", "memory_status",
   "memory_validation_report", "memory_hitrate", "memory_access_analytics",
+  "memory_tui_status",
 ];
 
 function defaultSessionId(): string {
@@ -1175,6 +1207,10 @@ async function dispatch(
         const daysBack = (params.days_back as number) ?? 7;
         const format = (params.format as "markdown" | "json") ?? "json";
         return await store.getValidationReport(daysBack, format);
+      }
+
+      case "memory_tui_status": {
+        return await store.getTUIStatus();
       }
 
       default:
