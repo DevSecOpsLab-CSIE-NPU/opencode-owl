@@ -244,7 +244,7 @@ const SCHEMA_VERSION     = 11;
 const DECAY_LAMBDA       = parseFloat(process.env.MEMORY_DECAY_LAMBDA ?? "0.1");
 const GLOBAL_SESSION_ID  = "__global__";
 const EMBED_DIM          = 768;
-const PACKAGE_VERSION    = "1.2.5";
+const PACKAGE_VERSION    = "1.2.1";
 const GITHUB_RELEASES_URL = "https://api.github.com/repos/DevSecOpsLab-CSIE-NPU/opencode-owl/releases/latest";
 
 // Configurable thresholds (env overrides)
@@ -3186,7 +3186,7 @@ const MemoryPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
         },
       }),
 
-      "owl:status": tool({
+      owl_status: tool({
         description: "Get OpenCode-Owl memory system status including hit rate and MCP server availability.",
         args: {},
         async execute(_, { sessionID }) {
