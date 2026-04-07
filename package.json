@@ -1,6 +1,6 @@
 {
   "name": "opencode-owl",
-  "version": "1.2.1",
+  "version": "1.2.5",
   "description": "Agent Memory System Plugin for OpenCode — FTS5 + sqlite-vec hybrid search, episode tracking, auto-reflection",
   "author": "AugustChaoTW",
   "license": "MIT",
