@@ -151,6 +151,14 @@ Restart OpenCode. The plugin initializes both databases on first run.
 | `memory_delete_relationship` | Remove relationships |
 | `memory_graph_export` | Export as Mermaid or Graphviz |
 
+### Refinements (v1.2.5)
+
+| Fix | Description |
+|-----|-------------|
+| Tool name validation | Fixed `owl:status` → `owl_status` to match Anthropic API pattern `^[a-zA-Z0-9_-]{1,128}$` |
+| Memory hook execution | Improved `experimental.chat.system.transform` hook with better error handling |
+| Version alignment | Unified version numbers across package.json and source code |
+
 ### Adaptive Forgetting (v1.2.5)
 
 | Tool | Description |
