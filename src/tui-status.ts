@@ -1,4 +1,12 @@
 import { Database } from "bun:sqlite";
+import { existsSync, readFileSync } from "fs";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const REPO_ROOT   = join(dirname(__filename), "..");
+const EVAL_STATUS_PATH = join(REPO_ROOT, "traces", "runs", ".eval_status.json");
+const LAST_SUMMARY_PATH = join(REPO_ROOT, "traces", "runs", "latest", "summary.json");
 
 export type StatusColor = "green" | "yellow" | "red" | "gray";
 
@@ -122,6 +130,43 @@ export class TUIStatusManager {
     return { hitRate, total, hits };
   }
 
+  private readEvalStatus(): { running: boolean; line: string | null } {
+    try {
+      if (!existsSync(EVAL_STATUS_PATH)) return { running: false, line: null };
+      const s = JSON.parse(readFileSync(EVAL_STATUS_PATH, "utf8")) as Record<string, unknown>;
+      if (s.running) {
+        return {
+          running: true,
+          line: `Eval: ${s.current_task ?? "?"} (${s.completed ?? 0}/${s.total ?? 0}) pass=${s.passed ?? 0}`,
+        };
+      }
+      // Show how long ago the last run finished
+      if (typeof s.last_run_ts === "number") {
+        const agoMs  = Date.now() - s.last_run_ts * 1000;
+        const agoStr = agoMs < 60_000
+          ? `${Math.round(agoMs / 1000)}s ago`
+          : `${Math.round(agoMs / 60_000)}m ago`;
+        try {
+          if (existsSync(LAST_SUMMARY_PATH)) {
+            const sum = JSON.parse(readFileSync(LAST_SUMMARY_PATH, "utf8")) as Record<string, unknown>;
+            const p   = typeof sum.pass_at_1 === "number" ? (sum.pass_at_1 * 100).toFixed(0) : "?";
+            return { running: false, line: `Last eval: ${sum.suite ?? "?"} pass@1=${p}% (${agoStr})` };
+          }
+        } catch { /* ignore */ }
+        return { running: false, line: `Last eval: finished ${agoStr}` };
+      }
+    } catch { /* ignore */ }
+
+    try {
+      if (!existsSync(LAST_SUMMARY_PATH)) return { running: false, line: null };
+      const s = JSON.parse(readFileSync(LAST_SUMMARY_PATH, "utf8")) as Record<string, unknown>;
+      const p = typeof s.pass_at_1 === "number" ? (s.pass_at_1 * 100).toFixed(0) : "?";
+      return { running: false, line: `Last eval: ${s.suite ?? "?"} pass@1=${p}%` };
+    } catch { /* ignore */ }
+
+    return { running: false, line: null };
+  }
+
   private createAvailableStatus(data: {
     hitRate: number;
     total: number;
@@ -131,20 +176,25 @@ export class TUIStatusManager {
     const color = this.getColorForHitRate(hitRate);
     const hitRateStr = hitRate.toFixed(1);
 
+    const eval_ = this.readEvalStatus();
+    const evalIndicator = eval_.running ? " ▶" : "";
+    const tooltipLines = [
+      `Hit Rate: ${hitRateStr}%`,
+      `Last 24h: ${hits}/${total} queries`,
+      `Status: ✓ Active`,
+      `Color: ${this.getColorName(color)}`,
+    ];
+    if (eval_.line) tooltipLines.push(eval_.line);
+
     return {
       isAvailable: true,
       hitRate,
       color,
-      label: `owl (${hitRateStr}%)`,
+      label: `owl (${hitRateStr}%)${evalIndicator}`,
       shortLabel: `owl`,
       tooltip: {
         title: "OpenCode-Owl Memory System",
-        lines: [
-          `Hit Rate: ${hitRateStr}%`,
-          `Last 24h: ${hits}/${total} queries`,
-          `Status: ✓ Active`,
-          `Color: ${this.getColorName(color)}`,
-        ],
+        lines: tooltipLines,
       },
       lastUpdate: Date.now(),
       responseTime: 0,

@@ -1,0 +1,20 @@
+{
+  "task_id": "t002",
+  "suite": "terminal",
+  "description": "The function `sliceLast` in src/slice.ts returns `arr.slice(arr.length - n)` but the test expects it to return the last n items in reversed order. Fix the implementation.",
+  "validation": {
+    "type": "unit_test",
+    "test_command": "bun test src/slice.test.ts",
+    "expected_pass": true
+  },
+  "scaffold": {
+    "create_files": {
+      "src/slice.ts": "export function sliceLast<T>(arr: T[], n: number): T[] {\n  return arr.slice(arr.length - n);\n}\n",
+      "src/slice.test.ts": "import { sliceLast } from './slice';\nimport { test, expect } from 'bun:test';\ntest('sliceLast reversed', () => expect(sliceLast([1,2,3,4,5], 3)).toEqual([5,4,3]));\n"
+    }
+  },
+  "scoring": {
+    "pass": {"pass_at_1": 1.0},
+    "fail": {"pass_at_1": 0.0}
+  }
+}

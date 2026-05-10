@@ -1,0 +1,24 @@
+version: "1"
+
+# Retry policy per failure class
+retries:
+  tool_error:
+    max: 2
+    backoff_s: 2
+    strategy: immediate
+  parse_error:
+    max: 1
+    backoff_s: 0
+    strategy: immediate
+  timeout:
+    max: 0             # timeouts are not retried; they count as hard failures
+  test_fail:
+    max: 0             # test failures are not retried; the task failed
+  edit_fail:
+    max: 1
+    backoff_s: 0
+    strategy: immediate
+
+# Global cap
+global_max_retries: 3
+count_retries_in_cost: true

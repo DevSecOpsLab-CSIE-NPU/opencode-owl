@@ -1,0 +1,6 @@
+name: edit
+description: Apply a targeted string replacement to a file
+mode: exact_string_replace   # old_string → new_string; fails if not unique
+require_read_first: true      # agent must have read the file this session
+max_file_size_kb: 512
+backup: false                 # traces capture diffs; no extra backup needed

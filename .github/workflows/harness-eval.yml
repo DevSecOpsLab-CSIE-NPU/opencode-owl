@@ -1,0 +1,50 @@
+name: Harness Eval (PR)
+
+on:
+  pull_request:
+    paths:
+      - "harness/**"
+      - "ahe/**"
+      - "evals/**"
+      - "owl.yaml"
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      - name: Run eval (terminal suite)
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        run: python ahe/run_eval.py --suite terminal
+
+      - name: Analyze failures
+        run: python ahe/analyze_failures.py --run traces/runs/latest --json
+
+      - name: Verify prediction (if proposal exists)
+        run: |
+          PROPOSALS=$(ls ahe/proposals/h-*.yaml 2>/dev/null | wc -l)
+          if [ "$PROPOSALS" -gt 0 ]; then
+            python ahe/verify_prediction.py
+          else
+            echo "No proposal found; skipping prediction verification."
+          fi
+
+      - name: Upload traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-traces-${{ github.run_id }}
+          path: traces/runs/
+          retention-days: 30

@@ -15,11 +15,16 @@
 
 import { Database } from "bun:sqlite";
 import * as sqliteVec from "sqlite-vec";
-import { join } from "path";
-import { mkdirSync, existsSync } from "fs";
+import { join, dirname } from "path";
+import { mkdirSync, existsSync, readFileSync } from "fs";
 import { homedir } from "os";
+import { spawnSync } from "child_process";
+import { fileURLToPath } from "url";
 import { ValidationFramework } from "./validation-framework";
 import { TUIStatusManager } from "./tui-status";
+
+const __filename = fileURLToPath(import.meta.url);
+const REPO_ROOT   = join(dirname(__filename), "..");
 
 type MemoryType     = "fact" | "experience" | "preference" | "skill";
 type MemoryLayer    = "global" | "project";
@@ -1058,6 +1063,8 @@ const TOOL_NAMES = [
   "memory_stats", "memory_status",
   "memory_validation_report", "memory_hitrate", "memory_access_analytics",
   "memory_tui_status",
+  // AHE — HarnessOps tools
+  "ahe_run_eval", "ahe_analyze_failures", "ahe_status",
 ];
 
 function defaultSessionId(): string {
@@ -1211,6 +1218,78 @@ async function dispatch(
 
       case "memory_tui_status": {
         return await store.getTUIStatus();
+      }
+
+      // ------------------------------------------------------------------ //
+      // AHE — HarnessOps tools                                              //
+      // ------------------------------------------------------------------ //
+
+      case "ahe_run_eval": {
+        const suite  = String(params.suite ?? "terminal");
+        const task   = typeof params.task === "string" ? params.task : undefined;
+        const args   = ["ahe/run_eval.py", "--suite", suite];
+        if (task) args.push("--task", task);
+
+        const result = spawnSync("python3", args, {
+          cwd:      REPO_ROOT,
+          encoding: "utf8",
+          timeout:  360_000,
+          env:      { ...process.env, OPENCODE_NO_AUTO_UPDATE: "1" },
+        });
+
+        const output = (result.stdout ?? "") + (result.stderr ?? "");
+        const ok     = result.status === 0;
+
+        // Best-effort: parse summary from traces/runs/latest/summary.json
+        let summary: Record<string, unknown> = {};
+        try {
+          const summaryPath = join(REPO_ROOT, "traces", "runs", "latest", "summary.json");
+          summary = JSON.parse(readFileSync(summaryPath, "utf8"));
+        } catch { /* no summary yet */ }
+
+        return { ok, exit_code: result.status, output: output.slice(-2000), summary };
+      }
+
+      case "ahe_analyze_failures": {
+        const run    = typeof params.run === "string" ? params.run : "traces/runs/latest";
+        const result = spawnSync(
+          "python3",
+          ["ahe/analyze_failures.py", "--run", run, "--json"],
+          { cwd: REPO_ROOT, encoding: "utf8", timeout: 30_000 }
+        );
+
+        if (result.status !== 0) {
+          throw new Error(`analyze_failures failed: ${result.stderr?.slice(0, 500)}`);
+        }
+
+        try {
+          return JSON.parse(result.stdout);
+        } catch {
+          return { raw: result.stdout.slice(0, 2000) };
+        }
+      }
+
+      case "ahe_status": {
+        const statusPath  = join(REPO_ROOT, "traces", "runs", ".eval_status.json");
+        const summaryPath = join(REPO_ROOT, "traces", "runs", "latest", "summary.json");
+
+        let evalStatus: Record<string, unknown> = { running: false };
+        let lastSummary: Record<string, unknown> = {};
+
+        try { evalStatus  = JSON.parse(readFileSync(statusPath,  "utf8")); } catch { /* not running */ }
+        try { lastSummary = JSON.parse(readFileSync(summaryPath, "utf8")); } catch { /* no run yet */ }
+
+        return {
+          eval_running:    evalStatus.running ?? false,
+          current_task:    evalStatus.current_task ?? null,
+          progress:        evalStatus.running
+            ? `${evalStatus.completed ?? 0}/${evalStatus.total ?? 0}`
+            : null,
+          last_run:        lastSummary.run_label ?? null,
+          last_pass_at_1:  lastSummary.pass_at_1 ?? null,
+          last_suite:      lastSummary.suite ?? null,
+          last_harness:    lastSummary.harness_hash ?? null,
+        };
       }
 
       default:

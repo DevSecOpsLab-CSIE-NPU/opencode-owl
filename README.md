@@ -1,6 +1,151 @@
-# OpenCode Memory System Plugin
+# opencode-owl
 
-Agent memory system for the OpenCode/Sisyphus framework. Gives AI coding agents persistent, structured memory across sessions — facts, preferences, procedural skills, and episode tracking.
+**OpenCode = executor. opencode-owl = HarnessOps / AHE layer.**
+
+opencode-owl is an observability-driven harness evolution system for OpenCode. It provides:
+
+1. **Agent Memory System** (v1.0–v1.2) — persistent, structured memory across sessions
+2. **HarnessOps / mini-AHE** (v1.3) — treat the agent runtime as a versioned, testable system
+
+The mini-AHE loop: `observe → classify → patch → evaluate → promote`
+
+---
+
+## v1.3.0 HarnessOps
+
+### The loop
+
+```bash
+# 1. Run eval suite (optionally switch backend)
+python ahe/run_eval.py --suite terminal
+python ahe/run_eval.py --suite terminal --backend claude-code
+
+# 2. Classify failures + diff insights
+python ahe/analyze_failures.py --run traces/runs/latest
+
+# 3. Generate harness patch proposal (enriched with owl memory lessons)
+python ahe/propose_patch.py --target harness/
+
+# 4. Apply the patch, then run candidate eval
+python ahe/run_eval.py --suite terminal
+
+# 5. Verify prediction was correct
+python ahe/verify_prediction.py
+
+# 6. Promote if criteria met
+python ahe/promote_harness.py
+```
+
+### Multi-backend support
+
+Configure backends in `owl.yaml`:
+
+```yaml
+base_agent:
+  backend: opencode          # default backend
+  backends:
+    opencode:
+      command: opencode
+      args: ["-p", "{prompt}", "-f", "json"]
+      env:
+        OPENCODE_NO_AUTO_UPDATE: "1"
+    claude-code:
+      command: claude
+      args: ["-p", "{prompt}", "--output-format", "json", "--dangerously-skip-permissions"]
+      env: {}
+```
+
+Switch backend at runtime: `python ahe/run_eval.py --suite terminal --backend claude-code`
+
+### Diff quality scoring
+
+Each eval task run captures a `git diff HEAD` against the scaffold baseline and scores it:
+
+| Metric | Description |
+|--------|-------------|
+| `lines_added` | Total lines added by the agent |
+| `precision` | Fraction of changed files that were expected |
+| `noise_ratio` | Fraction of changed files that were unexpected |
+
+Aggregate diff insights appear in the failure report under `diff_insights`.
+
+### owl memory integration
+
+- **Failure episodes** — each failing task is recorded as an owl episode with `failure_class`, `latency_s`, and `stderr_tail`
+- **Historical lessons** — `propose_patch.py` queries owl memory for past lessons on the dominant failure class and embeds them in the proposal YAML under `historical_lessons:`
+- **MCP bridge** — `ahe/owl_client.py` provides `owl_rpc()` and `query_memory()` used by both `run_eval.py` and `propose_patch.py`
+
+### Repo structure (v1.3)
+
+```
+opencode-owl/
+  owl.yaml              # harness manifest, backends, promotion criteria
+  harness/
+    prompts/            # system, planner, coder, reviewer
+    agents/             # role configs (model, timeout, tools)
+    tools/              # shell, edit, test, git policies
+    policies/           # permissions, retries, timeouts
+    memory/             # lessons learned, repo facts
+  evals/
+    tasks/              # terminal/, swe-mini/ task JSONs
+    scorers/            # unit_test.py, diff_quality.py, log_classifier.py
+  traces/
+    runs/               # per-run JSONL traces + summaries
+  ahe/
+    run_eval.py         # eval runner (multi-backend, diff capture, owl episodes)
+    analyze_failures.py # failure classifier + diff insights
+    propose_patch.py    # hypothesis + patch proposal (owl memory enriched)
+    verify_prediction.py# compare predicted vs actual metrics
+    promote_harness.py  # commit harness if criteria met
+    owl_client.py       # shared owl MCP HTTP client
+    schemas/trace.py    # trace data model (schema v2, diff_stats field)
+    proposals/          # h-NNNN.yaml proposal files
+  tests/               # 153 pytest tests
+  .github/workflows/
+    harness-eval.yml    # PR gate on harness/ changes
+    harness-nightly.yml # nightly full suite (02:00 Taiwan time)
+```
+
+### Trace schema v2
+
+```json
+{
+  "schema_version": "2",
+  "run_id": "a1b2c3d4",
+  "task_id": "t001",
+  "suite": "terminal",
+  "outcome": "pass",
+  "failure_class": null,
+  "latency_s": 12.4,
+  "diff_stats": {
+    "lines_added": 18,
+    "precision": 1.0,
+    "noise_ratio": 0.0
+  }
+}
+```
+
+### Harness change contract
+
+Every harness change gets a proposal YAML:
+
+```yaml
+change_id: h-0001
+component: policies/timeouts.yaml
+hypothesis: Increasing task_total_s will reduce timeout failures.
+expected_effect:
+  pass_at_1: +1.5%
+  timeout_rate: -20%
+risk:
+  regression: low
+rollback: git checkout harness/policies/timeouts.yaml
+historical_lessons:
+  - Task t003 (suite=terminal) failed as timeout. latency=300s. stderr: killed
+```
+
+---
+
+## Agent Memory System
 
 Based on **"Memory in the Age of AI Agents: A Survey"** (arXiv:2512.13564v2) and informed by production systems including GitHub Copilot Agentic Memory (2026), A-MEM (NeurIPS 2025), AWM (ICML 2025), and MemoryBank (AAAI 2024).
 

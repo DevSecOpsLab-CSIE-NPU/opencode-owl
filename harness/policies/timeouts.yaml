@@ -1,0 +1,21 @@
+version: "1"
+
+# Wall-clock limits per agent role
+agents:
+  planner:  30     # seconds
+  coder:    120
+  tester:   60
+  reviewer: 45
+
+# Per-tool limits (override agent limit if lower)
+tools:
+  shell:    30
+  test:     60
+  edit:     10
+  git:      15
+
+# Total per-task wall-clock limit
+task_total_s: 300
+
+# If exceeded: outcome = timeout, failure_class = timeout
+on_timeout: kill_and_record

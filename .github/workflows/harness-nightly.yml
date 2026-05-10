@@ -1,0 +1,54 @@
+name: Harness Eval (Nightly)
+
+on:
+  schedule:
+    - cron: "0 18 * * *"   # 18:00 UTC = 02:00 Taiwan time
+  workflow_dispatch:        # allow manual trigger
+
+jobs:
+  nightly-eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      - name: Run eval (terminal suite)
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        run: python ahe/run_eval.py --suite terminal
+
+      - name: Run eval (swe-mini suite)
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        run: python ahe/run_eval.py --suite swe-mini
+
+      - name: Analyze failures
+        run: python ahe/analyze_failures.py --run traces/runs/latest
+
+      - name: Propose harness patch
+        run: python ahe/propose_patch.py --target harness/
+
+      - name: Upload traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-traces-${{ github.run_id }}
+          path: traces/runs/
+          retention-days: 90
+
+      - name: Upload proposals
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-proposals-${{ github.run_id }}
+          path: ahe/proposals/
+          retention-days: 90

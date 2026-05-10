@@ -1,0 +1,66 @@
+project: opencode-owl
+version: "1.3.0"
+
+base_agent:
+  backend: opencode
+  backends:
+    opencode:
+      command: opencode
+      args:
+        - "-p"
+        - "{prompt}"
+        - "-f"
+        - "json"
+      env:
+        OPENCODE_NO_AUTO_UPDATE: "1"
+    claude-code:
+      command: claude
+      args:
+        - "-p"
+        - "{prompt}"
+        - "--output-format"
+        - "json"
+        - "--dangerously-skip-permissions"
+      env: {}
+
+harness:
+  prompts: harness/prompts
+  agents: harness/agents
+  tools: harness/tools
+  policies: harness/policies
+  memory: harness/memory
+
+eval:
+  task_dir: evals/tasks
+  output_dir: traces/runs
+  metric:
+    primary: pass_at_1
+    secondary:
+      - cost
+      - latency
+      - timeout_rate
+      - test_fail_rate
+
+promotion:
+  require_pass_rate_delta: 0.01   # candidate must beat baseline by ≥1%
+  max_cost_delta: 0.15            # cost may rise at most 15%
+  max_regression_tasks: 2         # at most 2 tasks may regress
+
+trace:
+  schema_version: "2"
+  output_format: jsonl
+  fields:
+    - run_id
+    - task_id
+    - suite
+    - harness_hash
+    - start_ts
+    - end_ts
+    - outcome          # pass | fail | timeout | error
+    - failure_class    # null | tool_error | test_fail | edit_fail | timeout | parse_error
+    - cost_usd
+    - latency_s
+    - tokens_in
+    - tokens_out
+    - exit_code
+    - stderr_tail

@@ -1,0 +1,10 @@
+name: tester
+role: Runs the test suite and reports results
+prompt: harness/prompts/system.md
+model: claude-haiku-4-5-20251001
+tools:
+  - shell
+  - read
+timeout_s: 60
+max_tokens: 1024
+temperature: 0.0

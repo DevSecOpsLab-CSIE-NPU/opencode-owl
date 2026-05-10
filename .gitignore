@@ -19,3 +19,17 @@ Thumbs.db
 
 # Debug
 *.log
+
+# HarnessOps — keep structure, ignore run artifacts
+traces/runs/*/
+!traces/runs/.gitkeep
+traces/summaries/*/
+!traces/summaries/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# References — PDFs are large binaries, not versioned
+references/pdfs/

@@ -1,0 +1,13 @@
+name: coder
+role: Executes the plan produced by planner
+prompt: harness/prompts/coder.md
+model: claude-sonnet-4-6
+tools:
+  - read
+  - edit
+  - shell
+  - grep
+  - test
+timeout_s: 120
+max_tokens: 8192
+temperature: 0.0

@@ -1,0 +1,19 @@
+{
+  "task_id": "t001",
+  "suite": "terminal",
+  "description": "Add a pure TypeScript function `clamp(n, min, max)` to src/utils.ts (create file if absent). It must return min if n<min, max if n>max, else n.",
+  "validation": {
+    "type": "unit_test",
+    "test_command": "bun test src/utils.test.ts",
+    "expected_pass": true
+  },
+  "scaffold": {
+    "create_files": {
+      "src/utils.test.ts": "import { clamp } from './utils';\nimport { test, expect } from 'bun:test';\ntest('clamp below', () => expect(clamp(0,1,10)).toBe(1));\ntest('clamp above', () => expect(clamp(20,1,10)).toBe(10));\ntest('clamp mid', () => expect(clamp(5,1,10)).toBe(5));\n"
+    }
+  },
+  "scoring": {
+    "pass": {"pass_at_1": 1.0, "test_fail_rate": 0.0},
+    "fail": {"pass_at_1": 0.0}
+  }
+}

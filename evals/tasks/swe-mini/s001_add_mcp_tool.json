@@ -1,0 +1,19 @@
+{
+  "task_id": "s001",
+  "suite": "swe-mini",
+  "description": "Add a new MCP tool `owl_ping` to src/mcp-server.ts. The tool takes no arguments and returns {pong: true, ts: <unix_ms>}. Register it alongside existing tools.",
+  "validation": {
+    "type": "unit_test",
+    "test_command": "bun test src/mcp-server.test.ts",
+    "expected_pass": true
+  },
+  "scaffold": {
+    "create_files": {
+      "src/mcp-server.test.ts": "import { test, expect } from 'bun:test';\n// Smoke test: mcp-server module loads without error\ntest('mcp-server loads', async () => {\n  const mod = await import('./mcp-server');\n  expect(mod).toBeDefined();\n});\n"
+    }
+  },
+  "scoring": {
+    "pass": {"pass_at_1": 1.0},
+    "fail": {"pass_at_1": 0.0}
+  }
+}

@@ -1,0 +1,27 @@
+version: "1"
+
+# Filesystem access
+filesystem:
+  read:
+    allow: ["**"]
+    deny: ["**/.env", "**/secrets/**", "**/*.key", "**/*.pem"]
+  write:
+    allow: ["**"]
+    deny:
+      - "harness/**"       # agents cannot modify their own harness
+      - "evals/**"         # benchmark is immutable during a run
+      - ".github/**"
+  delete:
+    allow: []              # no deletes during eval; patches go through propose_patch.py
+
+# Network
+network:
+  allow: false             # offline by default; override per-suite if needed
+
+# Shell
+shell:
+  allow_sudo: false
+  allow_background_processes: false
+
+# Harness self-modification
+harness_self_modify: false  # only ahe/propose_patch.py may touch harness/

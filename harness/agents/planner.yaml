@@ -1,0 +1,11 @@
+name: planner
+role: Decomposes a task into an ordered step plan
+prompt: harness/prompts/planner.md
+model: claude-sonnet-4-6
+tools:
+  - read
+  - grep
+  - shell
+timeout_s: 30
+max_tokens: 2048
+temperature: 0.0

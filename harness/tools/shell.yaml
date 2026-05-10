@@ -1,0 +1,21 @@
+name: shell
+description: Run a shell command and return stdout/stderr/exit_code
+allowed_commands:
+  - bun
+  - node
+  - python
+  - python3
+  - pytest
+  - git
+  - grep
+  - find
+  - cat
+  - ls
+  - diff
+blocked_patterns:
+  - "rm -rf /"
+  - ":(){ :|:& };:"
+  - "curl * | sh"
+  - "wget * | sh"
+timeout_s: 30
+working_dir: "{task_cwd}"

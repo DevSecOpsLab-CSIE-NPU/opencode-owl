@@ -1,0 +1,10 @@
+name: reviewer
+role: Reviews the coder output and approves or rejects
+prompt: harness/prompts/reviewer.md
+model: claude-sonnet-4-6
+tools:
+  - read
+  - grep
+timeout_s: 45
+max_tokens: 2048
+temperature: 0.0

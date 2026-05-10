@@ -1,0 +1,15 @@
+name: test
+description: Run the project test suite and return structured results
+backends:
+  bun:
+    detect: "package.json contains bun"
+    command: "bun test"
+  pytest:
+    detect: "pyproject.toml or pytest.ini present"
+    command: "python -m pytest -q --tb=short"
+  node:
+    detect: "package.json scripts.test exists"
+    command: "node --test"
+timeout_s: 60
+parse_output: true            # extract pass/fail counts from stdout
+fail_on_nonzero: true
