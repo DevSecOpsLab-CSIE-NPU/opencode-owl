@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "opencode-owl": {
+      "command": "bun",
+      "args": [
+        "/home/fychao/opencode-owl/dist/mcp-stdio.js"
+      ],
+      "env": {}
+    }
+  }
+}

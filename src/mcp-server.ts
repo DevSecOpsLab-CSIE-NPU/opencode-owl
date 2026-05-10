@@ -187,7 +187,7 @@ class EmbeddingService {
   isAvailable(): boolean { return this.available === true; }
 }
 
-class MemoryStore {
+export class MemoryStore {
   private projectDb: Database | null = null;
   private globalDb:  Database | null = null;
   private readonly projectDbPath: string;
@@ -1067,11 +1067,11 @@ const TOOL_NAMES = [
   "ahe_run_eval", "ahe_analyze_failures", "ahe_status",
 ];
 
-function defaultSessionId(): string {
+export function defaultSessionId(): string {
   return `project_${Buffer.from(process.cwd()).toString("base64").slice(0, 16)}`;
 }
 
-async function dispatch(
+export async function dispatch(
   store: MemoryStore,
   method: string,
   params: Record<string, unknown>
