@@ -7,14 +7,118 @@ opencode-owl is an observability-driven harness evolution system for OpenCode. I
 1. **Agent Memory System** (v1.0–v1.2) — persistent, structured memory across sessions
 2. **HarnessOps / mini-AHE** (v1.3) — treat the agent runtime as a versioned, testable system
 3. **Claude Code MCP** (v1.3.1) — stdio MCP transport for Claude Code compatibility
+4. **Skills Registry** (v1.4) — install and use [google/skills](https://github.com/google/skills)-format agent skills
 
 The mini-AHE loop: `observe → classify → patch → evaluate → promote`
 
 ---
 
+## v1.4.0 — Skills Registry
+
+opencode-owl can now install, manage, and apply agent skills from any [SKILL.md](https://agentskills.io/home)-format repository, including [google/skills](https://github.com/google/skills).
+
+### Install a skill
+
+```bash
+# Via MCP tool (from Claude Code or the HTTP server)
+skill_install({ repo: "google/skills", path: "skills/cloud/gemini-api" })
+
+# Or import a local SKILL.md directory
+memory_import_skill({ path: "/path/to/my-skill" })
+```
+
+Skills are fetched from GitHub via HTTPS (no `gh` CLI required), stored in `~/.local/share/opencode/skills/`, and indexed in owl memory for hybrid search.
+
+### Manage skills
+
+```
+skill_list()                           → list all installed skills + staleness
+skill_update()                         → re-fetch changed skills from upstream
+skill_remove({ name: "gemini-api" })   → uninstall a skill
+skill_check_compatibility({ name: "gemini-api" })  → check prerequisites
+```
+
+### Use skills in Claude Code
+
+```
+1. skill_search("gemini api")          → find relevant installed skills
+2. skill_apply("gemini-api")           → load full SKILL.md + all references
+3. ... use the skill knowledge ...
+4. memory_end_episode(outcome="success")
+```
+
+### Skills storage layout
+
+```
+~/.local/share/opencode/skills/
+  registry.json              ← installed skill manifest (repo, sha, memory_id)
+  google__skills__skills_cloud_gemini-api/
+    SKILL.md
+    references/
+      advanced_features.md
+      embeddings.md
+      ...
+```
+
+### Compatibility validation
+
+Skills with a `compatibility:` field in their frontmatter are automatically checked:
+
+| Pattern | Check |
+|---------|-------|
+| `Google Cloud credentials` | `gcloud auth print-access-token` |
+| `Ollama` | `curl http://localhost:11434/api/tags` |
+| `bun >=X` | `bun --version` semver compare |
+
+Incompatible skills display a ⚠️ warning in the system prompt. Results are cached for 5 minutes.
+
+### AHE skill injection
+
+The eval runner automatically injects relevant skills into task prompts (closes the AHE loop on skill quality):
+
+```bash
+python ahe/run_eval.py --suite terminal            # with skill injection
+python ahe/run_eval.py --suite terminal --no-skills # ablation baseline
+```
+
+Trace schema v3 records `injected_skills: [memory_id, ...]` per task run.
+
+### New MCP tools (v1.4)
+
+| Tool | Description |
+|------|-------------|
+| `memory_import_skill` | Import a local SKILL.md directory into owl memory |
+| `skill_install` | Fetch and install a skill from any GitHub repo |
+| `skill_list` | List installed skills with staleness indicator |
+| `skill_update` | Re-fetch all stale skills from upstream |
+| `skill_remove` | Uninstall a skill from registry and memory |
+| `skill_search` | Search installed skills by keyword |
+| `skill_apply` | Get full skill content (SKILL.md + all references) |
+| `skill_check_compatibility` | Check if a skill's prerequisites are met |
+
+### SKILL.md format
+
+opencode-owl supports the standard [Agent Skills](https://agentskills.io/home) format:
+
+```markdown
+---
+name: my-skill
+description: What this skill does and when to use it.
+compatibility: Requires active Google Cloud credentials.
+---
+
+# My Skill
+
+Skill body in markdown...
+```
+
+Reference files in a `references/` subdirectory are automatically discovered and embedded as citations.
+
+---
+
 ## v1.3.1 — Claude Code MCP Compatibility
 
-opencode-owl now works as a native MCP server for **Claude Code** via stdio transport.
+opencode-owl works as a native MCP server for **Claude Code** via stdio transport.
 
 ### Install for Claude Code
 
@@ -56,14 +160,21 @@ Or add manually to `~/.claude.json`:
 | `ahe_status` | AHE eval running state + last pass@1 |
 | `ahe_run_eval` | Run evaluation suite |
 | `ahe_analyze_failures` | Analyze eval failures |
+| `skill_search` | Search installed agent skills |
+| `skill_apply` | Load full skill content for current task |
+| `skill_install` | Install a skill from GitHub |
+| `skill_list` | List installed skills |
+| `skill_check_compatibility` | Check skill prerequisites |
 
 ### Recommended Workflow in Claude Code
 
 ```
-1. memory_query "<topic>"       → check for historical lessons
-2. memory_start_episode         → begin tracking
-3. ... do work ...
-4. memory_end_episode           → record outcome + lessons
+1. memory_query "<topic>"              → check for historical lessons
+2. skill_search "<technology>"         → find relevant installed skills
+3. skill_apply "<skill-name>"          → load skill knowledge
+4. memory_start_episode               → begin tracking
+5. ... do work ...
+6. memory_end_episode                 → record outcome + lessons
 ```
 
 Shared SQLite DB with the opencode plugin — memories are visible across both tools.
@@ -141,7 +252,7 @@ Aggregate diff insights appear in the failure report under `diff_insights`.
 - **Historical lessons** — `propose_patch.py` queries owl memory for past lessons on the dominant failure class and embeds them in the proposal YAML under `historical_lessons:`
 - **MCP bridge** — `ahe/owl_client.py` provides `owl_rpc()` and `query_memory()` used by both `run_eval.py` and `propose_patch.py`
 
-### Repo structure (v1.3)
+### Repo structure (v1.4)
 
 ```
 opencode-owl/
@@ -158,25 +269,33 @@ opencode-owl/
   traces/
     runs/               # per-run JSONL traces + summaries
   ahe/
-    run_eval.py         # eval runner (multi-backend, diff capture, owl episodes)
+    run_eval.py         # eval runner (multi-backend, skill injection, diff capture, owl episodes)
     analyze_failures.py # failure classifier + diff insights
     propose_patch.py    # hypothesis + patch proposal (owl memory enriched)
     verify_prediction.py# compare predicted vs actual metrics
     promote_harness.py  # commit harness if criteria met
     owl_client.py       # shared owl MCP HTTP client
-    schemas/trace.py    # trace data model (schema v2, diff_stats field)
+    schemas/trace.py    # trace data model (schema v3, diff_stats + injected_skills)
     proposals/          # h-NNNN.yaml proposal files
-  tests/               # 153 pytest tests
+  tests/               # 157 pytest tests
   .github/workflows/
     harness-eval.yml    # PR gate on harness/ changes
     harness-nightly.yml # nightly full suite (02:00 Taiwan time)
 ```
 
-### Trace schema v2
+Skills are stored outside the repo at runtime:
+
+```
+~/.local/share/opencode/skills/
+  registry.json         # installed skill manifests
+  <key>/                # downloaded SKILL.md + references/
+```
+
+### Trace schema v3
 
 ```json
 {
-  "schema_version": "2",
+  "schema_version": "3",
   "run_id": "a1b2c3d4",
   "task_id": "t001",
   "suite": "terminal",
@@ -187,7 +306,8 @@ opencode-owl/
     "lines_added": 18,
     "precision": 1.0,
     "noise_ratio": 0.0
-  }
+  },
+  "injected_skills": ["mem_1234_abcd"]
 }
 ```
 
@@ -629,7 +749,7 @@ Default port: **3100** — override with `MCP_PORT` env var.
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/rpc` | JSON-RPC 2.0 dispatch |
-| `GET`  | `/health` | `{ status: "ok", version: "v1.2.5" }` |
+| `GET`  | `/health` | `{ status: "ok", version: "v5" }` |
 | `GET`  | `/tools` | List all available tool names |
 
 ### JSON-RPC 2.0 Request Format
