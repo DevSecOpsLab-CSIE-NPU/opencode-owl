@@ -16,7 +16,7 @@
 import { Database } from "bun:sqlite";
 import * as sqliteVec from "sqlite-vec";
 import { join, dirname } from "path";
-import { mkdirSync, existsSync, readFileSync } from "fs";
+import { mkdirSync, existsSync, readFileSync, readdirSync, writeFileSync, rmSync } from "fs";
 import { homedir } from "os";
 import { spawnSync } from "child_process";
 import { fileURLToPath } from "url";
@@ -1056,6 +1056,159 @@ const JSON_HEADERS = {
   "Content-Type": "application/json",
 };
 
+// ── Skills (Issue #37-41) ─────────────────────────────────────────────────────
+
+interface SkillMdParsed {
+  name: string;
+  description: string;
+  compatibility: string;
+  body: string;
+  references: Array<{ name: string; content: string }>;
+}
+
+function parseSkillMd(skillDir: string): SkillMdParsed {
+  const skillPath = join(skillDir, "SKILL.md");
+  if (!existsSync(skillPath)) throw new Error(`SKILL.md not found at ${skillPath}`);
+  const raw = readFileSync(skillPath, "utf8");
+
+  let name = skillDir.split("/").pop() ?? skillDir;
+  let description = "";
+  let compatibility = "";
+  let body = raw;
+
+  const fmMatch = raw.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  if (fmMatch) {
+    const fm = fmMatch[1];
+    body = fmMatch[2].trim();
+    const nameMatch   = fm.match(/^name:\s*(.+)$/m);
+    const descMatch   = fm.match(/^description:\s*(.+)$/m);
+    const compatMatch = fm.match(/^compatibility:\s*(.+)$/m);
+    if (nameMatch)   name = nameMatch[1].trim();
+    if (descMatch)   description = descMatch[1].trim();
+    if (compatMatch) compatibility = compatMatch[1].trim();
+  }
+
+  const references: Array<{ name: string; content: string }> = [];
+  const refsDir = join(skillDir, "references");
+  if (existsSync(refsDir)) {
+    const files = readdirSync(refsDir).filter(f => f.endsWith(".md")).sort();
+    for (const f of files) {
+      references.push({ name: f, content: readFileSync(join(refsDir, f), "utf8") });
+    }
+  }
+
+  return { name, description, compatibility, body, references };
+}
+
+interface RegistryEntry {
+  repo: string;
+  path: string;
+  sha: string;
+  installed_at: number;
+  memory_id: string;
+  name: string;
+  description: string;
+  compatibility: string;
+  skill_dir: string;
+}
+
+const SKILLS_BASE_DIR = join(homedir(), ".local", "share", "opencode", "skills");
+const REGISTRY_PATH   = join(SKILLS_BASE_DIR, "registry.json");
+
+function loadRegistry(): Record<string, RegistryEntry> {
+  try { return JSON.parse(readFileSync(REGISTRY_PATH, "utf8")); } catch { return {}; }
+}
+
+function saveRegistry(r: Record<string, RegistryEntry>): void {
+  mkdirSync(SKILLS_BASE_DIR, { recursive: true });
+  writeFileSync(REGISTRY_PATH, JSON.stringify(r, null, 2));
+}
+
+function registryKey(repo: string, path: string): string {
+  return `${repo}__${path}`.replace(/\//g, "_");
+}
+
+async function fetchGitHubSha(repo: string, path: string): Promise<string> {
+  try {
+    const url = `https://api.github.com/repos/${repo}/contents/${path}/SKILL.md`;
+    const resp = await fetch(url, { headers: { Accept: "application/vnd.github.v3+json" }, signal: AbortSignal.timeout(8000) });
+    if (!resp.ok) return "";
+    const data = await resp.json() as { sha?: string };
+    return data.sha ?? "";
+  } catch { return ""; }
+}
+
+async function fetchGitHubFile(repo: string, filePath: string): Promise<string> {
+  const url = `https://api.github.com/repos/${repo}/contents/${filePath}`;
+  const resp = await fetch(url, { headers: { Accept: "application/vnd.github.v3+json" }, signal: AbortSignal.timeout(8000) });
+  if (!resp.ok) throw new Error(`GitHub fetch failed for ${filePath}: ${resp.status}`);
+  const data = await resp.json() as { content?: string; encoding?: string };
+  if (data.encoding === "base64" && data.content) {
+    return Buffer.from(data.content.replace(/\n/g, ""), "base64").toString("utf8");
+  }
+  throw new Error("Unexpected GitHub response format");
+}
+
+async function downloadSkill(repo: string, skillPath: string, destDir: string): Promise<void> {
+  mkdirSync(destDir, { recursive: true });
+
+  const skillMdContent = await fetchGitHubFile(repo, `${skillPath}/SKILL.md`);
+  writeFileSync(join(destDir, "SKILL.md"), skillMdContent);
+
+  try {
+    const refsUrl = `https://api.github.com/repos/${repo}/contents/${skillPath}/references`;
+    const resp = await fetch(refsUrl, { headers: { Accept: "application/vnd.github.v3+json" }, signal: AbortSignal.timeout(8000) });
+    if (resp.ok) {
+      const files = await resp.json() as Array<{ name: string; path: string; type: string }>;
+      const mdFiles = files.filter(f => f.type === "file" && f.name.endsWith(".md"));
+      if (mdFiles.length > 0) {
+        mkdirSync(join(destDir, "references"), { recursive: true });
+        for (const f of mdFiles) {
+          const content = await fetchGitHubFile(repo, f.path);
+          writeFileSync(join(destDir, "references", f.name), content);
+        }
+      }
+    }
+  } catch { /* references dir is optional */ }
+}
+
+interface CompatResult {
+  compatible: boolean;
+  reason: string;
+  check: string;
+}
+
+const _compatCache = new Map<string, { result: CompatResult; ts: number }>();
+
+function checkCompatibility(compatibility: string): CompatResult {
+  if (!compatibility) return { compatible: true, reason: "", check: "" };
+
+  const cached = _compatCache.get(compatibility);
+  if (cached && Date.now() - cached.ts < 300_000) return cached.result;
+
+  const lower = compatibility.toLowerCase();
+  let result: CompatResult = { compatible: true, reason: "", check: "" };
+
+  if (lower.includes("google cloud credential") || lower.includes("gcloud")) {
+    const r = spawnSync("gcloud", ["auth", "print-access-token"], { encoding: "utf8", timeout: 5000 });
+    if (r.status !== 0) {
+      result = { compatible: false, reason: "gcloud not authenticated", check: "gcloud auth print-access-token" };
+    }
+  }
+
+  if (result.compatible && lower.includes("ollama")) {
+    const r = spawnSync("curl", ["-sf", "http://localhost:11434/api/tags"], { encoding: "utf8", timeout: 3000 });
+    if (r.status !== 0) {
+      result = { compatible: false, reason: "Ollama not running on localhost:11434", check: "curl -sf http://localhost:11434/api/tags" };
+    }
+  }
+
+  _compatCache.set(compatibility, { result, ts: Date.now() });
+  return result;
+}
+
+// ── Tool names ────────────────────────────────────────────────────────────────
+
 const TOOL_NAMES = [
   "memory_query", "memory_add", "memory_list", "memory_update", "memory_delete",
   "memory_reinforce", "memory_add_skill", "memory_approve_skill", "memory_validate_citations",
@@ -1065,6 +1218,10 @@ const TOOL_NAMES = [
   "memory_tui_status",
   // AHE — HarnessOps tools
   "ahe_run_eval", "ahe_analyze_failures", "ahe_status",
+  // Skills registry (Issue #37-41)
+  "memory_import_skill",
+  "skill_install", "skill_list", "skill_update", "skill_remove",
+  "skill_search", "skill_apply", "skill_check_compatibility",
 ];
 
 export function defaultSessionId(): string {
@@ -1225,10 +1382,12 @@ export async function dispatch(
       // ------------------------------------------------------------------ //
 
       case "ahe_run_eval": {
-        const suite  = String(params.suite ?? "terminal");
-        const task   = typeof params.task === "string" ? params.task : undefined;
-        const args   = ["ahe/run_eval.py", "--suite", suite];
+        const suite    = String(params.suite ?? "terminal");
+        const task     = typeof params.task === "string" ? params.task : undefined;
+        const noSkills = params.no_skills === true;
+        const args     = ["ahe/run_eval.py", "--suite", suite];
         if (task) args.push("--task", task);
+        if (noSkills) args.push("--no-skills");
 
         const result = spawnSync("python3", args, {
           cwd:      REPO_ROOT,
@@ -1290,6 +1449,235 @@ export async function dispatch(
           last_suite:      lastSummary.suite ?? null,
           last_harness:    lastSummary.harness_hash ?? null,
         };
+      }
+
+      // ------------------------------------------------------------------ //
+      // Skills registry (Issue #37-41)                                      //
+      // ------------------------------------------------------------------ //
+
+      case "memory_import_skill": {
+        const skillDir  = String(params.path ?? "");
+        const layer     = (params.layer as MemoryLayer) ?? "project";
+        if (!skillDir) throw new Error("path is required");
+
+        const parsed    = parseSkillMd(skillDir);
+        const citations = parsed.references.map(r => join(skillDir, "references", r.name));
+        const fullContent = [
+          `SKILL: ${parsed.name}`,
+          parsed.description ? `Description: ${parsed.description}` : "",
+          parsed.compatibility ? `Compatibility: ${parsed.compatibility}` : "",
+          "",
+          parsed.body,
+        ].filter(Boolean).join("\n");
+
+        const id = store.addMemory(
+          {
+            type: "skill",
+            content: fullContent,
+            metadata: {
+              skillName: parsed.name,
+              description: parsed.description,
+              compatibility: parsed.compatibility,
+              source: "imported",
+              citations,
+              addedBy: "memory_import_skill",
+            },
+            importance: 0.75,
+          },
+          layer
+        );
+        if (!id) throw new Error("Failed to store imported skill");
+        return { id, name: parsed.name, description: parsed.description, references: parsed.references.length, layer };
+      }
+
+      case "skill_install": {
+        const repo      = String(params.repo ?? "");
+        const skillPath = String(params.path ?? "");
+        if (!repo || !skillPath) throw new Error("repo and path are required");
+
+        const key     = registryKey(repo, skillPath);
+        const destDir = join(SKILLS_BASE_DIR, key);
+        const sha     = await fetchGitHubSha(repo, skillPath);
+
+        await downloadSkill(repo, skillPath, destDir);
+
+        const parsed   = parseSkillMd(destDir);
+        const citations = parsed.references.map(r => join(destDir, "references", r.name));
+        const fullContent = [
+          `SKILL: ${parsed.name}`,
+          parsed.description ? `Description: ${parsed.description}` : "",
+          parsed.compatibility ? `Compatibility: ${parsed.compatibility}` : "",
+          "",
+          parsed.body,
+        ].filter(Boolean).join("\n");
+
+        const memId = store.addMemory(
+          {
+            type: "skill",
+            content: fullContent,
+            metadata: {
+              skillName: parsed.name,
+              description: parsed.description,
+              compatibility: parsed.compatibility,
+              source: "imported",
+              repo,
+              skillPath,
+              citations,
+              addedBy: "skill_install",
+            },
+            importance: 0.75,
+          },
+          "project"
+        );
+        if (!memId) throw new Error("Failed to store skill in memory");
+
+        const registry = loadRegistry();
+        registry[key] = {
+          repo, path: skillPath, sha, installed_at: Date.now(),
+          memory_id: memId, name: parsed.name, description: parsed.description,
+          compatibility: parsed.compatibility, skill_dir: destDir,
+        };
+        saveRegistry(registry);
+
+        return { installed: true, memory_id: memId, name: parsed.name, repo, path: skillPath, sha, references: parsed.references.length };
+      }
+
+      case "skill_list": {
+        const registry = loadRegistry();
+        const entries = Object.values(registry);
+        const result = await Promise.all(entries.map(async e => {
+          const latestSha = await fetchGitHubSha(e.repo, e.path);
+          return {
+            name: e.name,
+            repo: e.repo,
+            path: e.path,
+            memory_id: e.memory_id,
+            installed_at: new Date(e.installed_at).toISOString(),
+            stale: latestSha !== "" && latestSha !== e.sha,
+            compatibility: e.compatibility,
+          };
+        }));
+        return result;
+      }
+
+      case "skill_update": {
+        const registry = loadRegistry();
+        const updated: string[] = [];
+        const upToDate: string[] = [];
+
+        for (const [key, entry] of Object.entries(registry)) {
+          const latestSha = await fetchGitHubSha(entry.repo, entry.path);
+          if (latestSha === entry.sha || latestSha === "") {
+            upToDate.push(entry.name);
+            continue;
+          }
+
+          await downloadSkill(entry.repo, entry.path, entry.skill_dir);
+          const parsed   = parseSkillMd(entry.skill_dir);
+          const citations = parsed.references.map(r => join(entry.skill_dir, "references", r.name));
+          const fullContent = [
+            `SKILL: ${parsed.name}`,
+            parsed.description ? `Description: ${parsed.description}` : "",
+            parsed.compatibility ? `Compatibility: ${parsed.compatibility}` : "",
+            "",
+            parsed.body,
+          ].filter(Boolean).join("\n");
+
+          store.updateMemory(entry.memory_id, {
+            content: fullContent,
+            metadata: {
+              skillName: parsed.name, description: parsed.description,
+              compatibility: parsed.compatibility, source: "imported",
+              repo: entry.repo, skillPath: entry.path, citations, addedBy: "skill_update",
+            },
+          });
+
+          registry[key] = { ...entry, sha: latestSha, name: parsed.name,
+            description: parsed.description, compatibility: parsed.compatibility };
+          updated.push(entry.name);
+        }
+
+        saveRegistry(registry);
+        return { updated, up_to_date: upToDate };
+      }
+
+      case "skill_remove": {
+        const name = String(params.name ?? "");
+        if (!name) throw new Error("name is required");
+
+        const registry = loadRegistry();
+        const key = Object.keys(registry).find(k => registry[k].name === name || registry[k].memory_id === name);
+        if (!key) throw new Error(`Skill not found: ${name}`);
+
+        const entry = registry[key];
+        store.deleteMemory(entry.memory_id);
+
+        try { rmSync(entry.skill_dir, { recursive: true, force: true }); } catch { /* ok */ }
+        delete registry[key];
+        saveRegistry(registry);
+
+        return { removed: true, name: entry.name, memory_id: entry.memory_id };
+      }
+
+      case "skill_search": {
+        const query = String(params.query ?? "");
+        const limit = typeof params.limit === "number" ? params.limit : 5;
+        if (!query) throw new Error("query is required");
+
+        const results = store.queryMemories({ search: query, type: "skill", limit, layers: ["project", "global"] });
+        const registry = loadRegistry();
+        const byMemId = new Map(Object.values(registry).map(e => [e.memory_id, e]));
+
+        return results.map((r: MemoryEntry) => {
+          const reg = byMemId.get(r.id);
+          return {
+            memory_id: r.id,
+            name: (r.metadata as Record<string, unknown>)?.skillName ?? r.id,
+            description: (r.metadata as Record<string, unknown>)?.description ?? "",
+            compatibility: (r.metadata as Record<string, unknown>)?.compatibility ?? "",
+            repo: reg?.repo ?? null,
+            installed_at: reg ? new Date(reg.installed_at).toISOString() : null,
+            content_preview: r.content.slice(0, 300),
+            decay_score: r.decayScore ?? null,
+          };
+        });
+      }
+
+      case "skill_apply": {
+        const name = String(params.name ?? "");
+        if (!name) throw new Error("name is required");
+
+        const registry = loadRegistry();
+        const entry = Object.values(registry).find(e => e.name === name || e.memory_id === name);
+
+        if (entry && existsSync(entry.skill_dir)) {
+          const parsed = parseSkillMd(entry.skill_dir);
+          const refContent = parsed.references.map(r => `### ${r.name}\n\n${r.content}`).join("\n\n---\n\n");
+          return {
+            name: parsed.name,
+            description: parsed.description,
+            compatibility: parsed.compatibility,
+            body: parsed.body,
+            references: refContent,
+            full_text: `# ${parsed.name}\n\n${parsed.body}${refContent ? `\n\n## References\n\n${refContent}` : ""}`,
+          };
+        }
+
+        // Fallback: retrieve from memory DB
+        const results = store.queryMemories({ search: name, type: "skill", limit: 1, layers: ["project", "global"] });
+        if (results.length === 0) throw new Error(`Skill not found: ${name}`);
+        const r = results[0] as MemoryEntry;
+        return { name, body: r.content, description: "", compatibility: "", references: "", full_text: r.content };
+      }
+
+      case "skill_check_compatibility": {
+        const memId        = String(params.memory_id ?? "");
+        const skillName    = String(params.name ?? "");
+        const registry     = loadRegistry();
+        const entry        = Object.values(registry).find(e => e.memory_id === memId || e.name === skillName);
+        const compatibility = entry?.compatibility ?? String(params.compatibility ?? "");
+        const result       = checkCompatibility(compatibility);
+        return { ...result, compatibility, skill: entry?.name ?? skillName };
       }
 
       default:

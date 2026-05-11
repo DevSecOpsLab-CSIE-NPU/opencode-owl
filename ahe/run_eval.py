@@ -162,8 +162,40 @@ def _capture_diff(workdir: Path, expected_files: list[str]) -> dict:
         return {}
 
 
+def inject_skills(prompt: str, task: dict, no_skills: bool) -> tuple[str, list[str]]:
+    """Query owl memory for relevant skills and prepend them to the prompt.
+
+    Returns (augmented_prompt, injected_memory_ids).
+    """
+    if no_skills:
+        return prompt, []
+
+    query = task.get("description", "")[:200]
+    try:
+        result = owl_rpc("memory_query", {"query": query, "type": "skill", "limit": 3})
+    except Exception:
+        return prompt, []
+
+    if not result or not isinstance(result, list):
+        return prompt, []
+
+    skills = [r for r in result if isinstance(r, dict) and r.get("decayScore", 1) > 0.5]
+    if not skills:
+        return prompt, []
+
+    skill_section = "## Relevant Skills\n\n"
+    for s in skills:
+        content = s.get("content", "")
+        if content:
+            skill_section += content.strip() + "\n\n"
+
+    augmented = skill_section + prompt
+    memory_ids = [s["id"] for s in skills if "id" in s]
+    return augmented, memory_ids
+
+
 def run_task(task: dict, suite: str, harness_dir: Path | None,
-             backend: dict | None = None) -> Trace:
+             backend: dict | None = None, no_skills: bool = False) -> Trace:
     trace = Trace(
         task_id=task["task_id"],
         suite=suite,
@@ -176,6 +208,9 @@ def run_task(task: dict, suite: str, harness_dir: Path | None,
         _git_init_and_commit(workdir)   # baseline snapshot for diff_quality
 
         prompt = task["description"]
+        prompt, injected_skills = inject_skills(prompt, task, no_skills)
+        trace.injected_skills = injected_skills
+
         system_prompt_path = (harness_dir or ROOT / "harness") / "prompts" / "system.md"
         system_prompt = system_prompt_path.read_text() if system_prompt_path.exists() else ""
 
@@ -251,6 +286,8 @@ def main():
     parser.add_argument("--candidate", default=None, help="Path to candidate harness dir")
     parser.add_argument("--backend", default=None,
                         help="Executor backend name (opencode|claude-code); overrides owl.yaml")
+    parser.add_argument("--no-skills", action="store_true",
+                        help="Disable skill injection (for ablation comparison)")
     args = parser.parse_args()
 
     tasks = load_tasks(args.suite, args.task)
@@ -278,7 +315,7 @@ def main():
         })
 
         print(f"  {task['task_id']} ... ", end="", flush=True)
-        trace = run_task(task, args.suite, harness_dir, backend)
+        trace = run_task(task, args.suite, harness_dir, backend, no_skills=args.no_skills)
         traces.append(trace)
         print(trace.outcome)
 

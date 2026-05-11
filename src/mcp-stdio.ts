@@ -129,6 +129,57 @@ const TOOLS = [
     description: "Get opencode-owl system status: memory counts, episode state, hit rate.",
     inputSchema: { type: "object", properties: {} },
   },
+  {
+    name: "skill_search",
+    description: "Search installed agent skills by keyword or topic.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Search query" },
+        limit: { type: "number", description: "Max results (default 5)" },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "skill_apply",
+    description: "Get the full content of an installed skill (SKILL.md + references) for use in the current task.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Skill name or memory_id" },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "skill_install",
+    description: "Install a skill from a GitHub repo into the owl registry and memory.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string", description: "GitHub repo, e.g. google/skills" },
+        path: { type: "string", description: "Path to skill dir, e.g. skills/cloud/gemini-api" },
+      },
+      required: ["repo", "path"],
+    },
+  },
+  {
+    name: "skill_list",
+    description: "List all installed skills with version and staleness info.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "skill_check_compatibility",
+    description: "Check whether an installed skill's prerequisites are met.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Skill name or memory_id" },
+      },
+      required: ["name"],
+    },
+  },
 ];
 
 // ── MCP stdio protocol ────────────────────────────────────────────────────────
@@ -151,7 +202,7 @@ async function handleRequest(req: Record<string, unknown>): Promise<void> {
       result = {
         protocolVersion: "2024-11-05",
         capabilities:    { tools: {} },
-        serverInfo:      { name: "opencode-owl", version: "1.3.0" },
+        serverInfo:      { name: "opencode-owl", version: "1.4.0" },
       };
     } else if (method === "tools/list") {
       result = { tools: TOOLS };

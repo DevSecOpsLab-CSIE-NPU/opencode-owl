@@ -15,7 +15,7 @@ FailureClassT = Literal[
 
 @dataclass
 class Trace:
-    schema_version: str = "2"
+    schema_version: str = "3"
     run_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
     task_id: str = ""
     suite: str = ""
@@ -34,6 +34,8 @@ class Trace:
     stderr_tail: str = ""        # last 500 chars of stderr
     # diff_stats: populated by run_eval.py via diff_quality scorer
     diff_stats: dict = field(default_factory=dict)
+    # injected_skills: memory IDs of skills injected into the task prompt
+    injected_skills: list = field(default_factory=list)
 
     def finish(self, outcome: OutcomeT, **kwargs):
         self.end_ts = time.time()

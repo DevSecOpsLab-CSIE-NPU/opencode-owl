@@ -10,7 +10,7 @@ from ahe.schemas.trace import Trace
 class TestTraceDefaults:
     def test_schema_version(self):
         t = Trace()
-        assert t.schema_version == "2"
+        assert t.schema_version == "3"
 
     def test_run_id_is_8_chars(self):
         t = Trace()
@@ -113,7 +113,7 @@ class TestTraceSerialization:
 
     def test_schema_version_is_2(self):
         t = Trace()
-        assert t.schema_version == "2"
+        assert t.schema_version == "3"
 
     def test_diff_stats_default_is_empty_dict(self):
         t = Trace()
