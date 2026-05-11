@@ -36,11 +36,13 @@ for arg in "$@"; do
 done
 
 if $GLOBAL; then
-  CONFIG_FILE="${HOME}/.claude/claude_desktop_config.json"
+  # Global: Claude Code reads ~/.claude/mcp.json for user-level MCP servers
+  CONFIG_FILE="${HOME}/.claude/mcp.json"
   CONFIG_DIR="${HOME}/.claude"
 else
-  CONFIG_FILE="${PWD}/.claude/mcp.json"
-  CONFIG_DIR="${PWD}/.claude"
+  # Project: Claude Code reads .mcp.json in the project root
+  CONFIG_FILE="${PWD}/.mcp.json"
+  CONFIG_DIR="${PWD}"
 fi
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -82,7 +84,7 @@ fi
 ensure_jq
 build_if_needed
 
-mkdir -p "$CONFIG_DIR"
+if $GLOBAL; then mkdir -p "$CONFIG_DIR"; fi
 
 # Create config file if missing
 if [ ! -f "$CONFIG_FILE" ]; then

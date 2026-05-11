@@ -6,8 +6,74 @@ opencode-owl is an observability-driven harness evolution system for OpenCode. I
 
 1. **Agent Memory System** (v1.0–v1.2) — persistent, structured memory across sessions
 2. **HarnessOps / mini-AHE** (v1.3) — treat the agent runtime as a versioned, testable system
+3. **Claude Code MCP** (v1.3.1) — stdio MCP transport for Claude Code compatibility
 
 The mini-AHE loop: `observe → classify → patch → evaluate → promote`
+
+---
+
+## v1.3.1 — Claude Code MCP Compatibility
+
+opencode-owl now works as a native MCP server for **Claude Code** via stdio transport.
+
+### Install for Claude Code
+
+```bash
+# Project scope (.mcp.json)
+./install-claude.sh
+
+# Global scope (~/.claude/mcp.json)
+./install-claude.sh --global
+
+# Uninstall
+./install-claude.sh --uninstall
+```
+
+Or add manually to `~/.claude.json`:
+
+```json
+{
+  "mcpServers": {
+    "opencode-owl": {
+      "command": "bun",
+      "args": ["/path/to/opencode-owl/dist/mcp-stdio.js"],
+      "env": {}
+    }
+  }
+}
+```
+
+### Available MCP Tools in Claude Code
+
+| Tool | Description |
+|------|-------------|
+| `memory_query` | Search owl memory |
+| `memory_add` | Store a new memory |
+| `memory_stats` | Memory statistics |
+| `memory_start_episode` | Begin a learning episode |
+| `memory_end_episode` | End episode, promote lessons |
+| `memory_status` / `owl_status` | System status |
+| `ahe_status` | AHE eval running state + last pass@1 |
+| `ahe_run_eval` | Run evaluation suite |
+| `ahe_analyze_failures` | Analyze eval failures |
+
+### Recommended Workflow in Claude Code
+
+```
+1. memory_query "<topic>"       → check for historical lessons
+2. memory_start_episode         → begin tracking
+3. ... do work ...
+4. memory_end_episode           → record outcome + lessons
+```
+
+Shared SQLite DB with the opencode plugin — memories are visible across both tools.
+
+### Technical
+
+- `src/mcp-stdio.ts` — stdio JSON-RPC 2.0 transport (newline-delimited)
+- Reuses `MemoryStore` and `dispatch` from `mcp-server.ts`
+- Build: `bun run build` (outputs `dist/mcp-stdio.js`)
+- Run standalone: `bun run mcp:stdio`
 
 ---
 
