@@ -1224,6 +1224,50 @@ const TOOL_NAMES = [
   "skill_search", "skill_apply", "skill_check_compatibility",
 ];
 
+const DEFAULT_QUERY_CACHE_TTL_MS = 30_000;
+const MAX_QUERY_CACHE_ENTRIES    = 200;
+
+const _queryCache = new Map<string, { result: unknown; ts: number; sessionId: string }>();
+let queryCacheHits   = 0;
+let queryCacheMisses = 0;
+
+function queryCacheTtlMs(): number {
+  const raw = process.env.MEMORY_QUERY_CACHE_TTL_MS;
+  if (raw === undefined) return DEFAULT_QUERY_CACHE_TTL_MS;
+
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_QUERY_CACHE_TTL_MS;
+}
+
+function memoryQueryCacheKey(
+  params: Record<string, unknown>,
+  sessionId: string,
+  layers: MemoryLayer[]
+): string {
+  return JSON.stringify({
+    q: String(params.query ?? ""),
+    t: params.type ?? null,
+    l: params.limit ?? 10,
+    layers,
+    s: sessionId,
+  });
+}
+
+function pruneQueryCache(now = Date.now()): void {
+  if (_queryCache.size <= MAX_QUERY_CACHE_ENTRIES) return;
+
+  const ttl = queryCacheTtlMs();
+  for (const [key, value] of _queryCache) {
+    if (now - value.ts > ttl) _queryCache.delete(key);
+  }
+}
+
+function invalidateQueryCache(sessionId: string): void {
+  for (const [key, value] of _queryCache) {
+    if (value.sessionId === sessionId) _queryCache.delete(key);
+  }
+}
+
 export function defaultSessionId(): string {
   return `project_${Buffer.from(process.cwd()).toString("base64").slice(0, 16)}`;
 }
@@ -1245,7 +1289,19 @@ export async function dispatch(
       const layers = Array.isArray(params.layers)
         ? (params.layers as MemoryLayer[])
         : (["project", "global"] as MemoryLayer[]);
+      const cacheKey = memoryQueryCacheKey(params, sessionId, layers);
+      const cached = _queryCache.get(cacheKey);
+      const now = Date.now();
+      const ttl = queryCacheTtlMs();
+      if (cached && now - cached.ts < ttl) {
+        queryCacheHits++;
+        return cached.result;
+      }
+
+      queryCacheMisses++;
       const results = store.queryMemories({ search: query, type, limit, layers });
+      _queryCache.set(cacheKey, { result: results, ts: now, sessionId });
+      pruneQueryCache(now);
       return results;
     }
 
@@ -1256,6 +1312,7 @@ export async function dispatch(
       const layer      = (params.layer as MemoryLayer) ?? "project";
       const id = store.addMemory({ type, content, metadata: { addedBy: "mcp" }, importance }, layer);
       if (!id) throw new Error("Failed to store memory");
+      invalidateQueryCache(sessionId);
       return { id, layer };
     }
 
@@ -1273,12 +1330,14 @@ export async function dispatch(
       const metadata   = typeof params.metadata === "object" && params.metadata !== null
         ? (params.metadata as Record<string, unknown>) : undefined;
       const ok = store.updateMemory(id, { content, importance, metadata });
+      if (ok) invalidateQueryCache(sessionId);
       return { success: ok, id };
     }
 
     case "memory_delete": {
       const id = String(params.id ?? "");
       const ok = store.deleteMemory(id);
+      if (ok) invalidateQueryCache(sessionId);
       return { success: ok, id };
     }
 
@@ -1364,7 +1423,11 @@ export async function dispatch(
 
       case "memory_access_analytics": {
         const layer = (params.layer as "project" | "global") ?? "project";
-        return store.getAccessAnalytics(layer);
+        return {
+          ...store.getAccessAnalytics(layer),
+          queryCacheHits,
+          queryCacheMisses,
+        };
       }
 
       case "memory_validation_report": {
